@@ -1,0 +1,1255 @@
+#!/usr/bin/env python3
+"""Turn raw Linux system statistics into plain English sentences.
+
+Reads /proc and /sys directly -- no dependencies, no root -- samples CPU over a
+real interval, and prints one line of JSON describing what the machine is doing
+in the words a person would use, not the ones btop uses.
+
+  plain-english-activity            one sample, one JSON line, exit
+  plain-english-activity --watch    a JSON line every INTERVAL seconds, forever
+  plain-english-activity --text     the same report as readable text
+
+The QML front-end renders the JSON; the --text mode is what makes this
+debuggable from a terminal.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+HZ = os.sysconf("SC_CLK_TCK")
+PAGE = os.sysconf("SC_PAGE_SIZE")
+NCPU = os.cpu_count() or 1
+
+# ---------------------------------------------------------------------------
+# Who is this process, in words
+# ---------------------------------------------------------------------------
+#
+# name -> (display name, what it is, kind)
+#
+# `kind` drives the "should I worry" phrasing later on:
+#   app      something you opened; busy is your business
+#   browser  an app, but one that is busy for well-understood reasons
+#   dev      a compiler, test run, or dev server; busy is the point, and it ends
+#   agent    an AI coding agent; busy means it is working
+#   system   part of the OS or desktop; busy is usually temporary
+#   kernel   the kernel itself; effectively never worth worrying about
+#   media    audio/video; busy is expected while something is playing
+PROCESSES = {
+    # Browsers
+    "chrome": ("Chrome", "your web browser", "browser"),
+    "chromium": ("Chromium", "your web browser", "browser"),
+    "brave": ("Brave", "your web browser", "browser"),
+    "firefox": ("Firefox", "your web browser", "browser"),
+    "librewolf": ("LibreWolf", "your web browser", "browser"),
+    "zen": ("Zen", "your web browser", "browser"),
+    "vivaldi": ("Vivaldi", "your web browser", "browser"),
+    "epiphany": ("GNOME Web", "your web browser", "browser"),
+    "qutebrowser": ("qutebrowser", "your web browser", "browser"),
+    "msedge": ("Edge", "your web browser", "browser"),
+    # Editors and terminals
+    "nvim": ("Neovim", "your editor", "app"),
+    "vim": ("Vim", "your editor", "app"),
+    "code": ("VS Code", "your editor", "app"),
+    "codium": ("VSCodium", "your editor", "app"),
+    "zed": ("Zed", "your editor", "app"),
+    "emacs": ("Emacs", "your editor", "app"),
+    "helix": ("Helix", "your editor", "app"),
+    "hx": ("Helix", "your editor", "app"),
+    "alacritty": ("Alacritty", "a terminal window", "app"),
+    "ghostty": ("Ghostty", "a terminal window", "app"),
+    "kitty": ("Kitty", "a terminal window", "app"),
+    "foot": ("Foot", "a terminal window", "app"),
+    "wezterm-gui": ("WezTerm", "a terminal window", "app"),
+    "tmux": ("tmux", "your terminal session manager", "app"),
+    "bash": ("a shell", "a command prompt or a script someone started", "system"),
+    "zsh": ("a shell", "a command prompt or a script someone started", "system"),
+    "fish": ("a shell", "a command prompt or a script someone started", "system"),
+    # AI agents
+    "claude": ("Claude Code", "an AI coding agent", "agent"),
+    "codex": ("Codex", "an AI coding agent", "agent"),
+    "opencode": ("OpenCode", "an AI coding agent", "agent"),
+    "aider": ("Aider", "an AI coding agent", "agent"),
+    "cursor": ("Cursor", "an AI-assisted editor", "agent"),
+    "ollama": ("Ollama", "a local AI model runner", "agent"),
+    "llama-server": ("llama.cpp", "a local AI model runner", "agent"),
+    # Chat and comms
+    "slack": ("Slack", "your work chat", "app"),
+    "discord": ("Discord", "a chat app", "app"),
+    "signal-desktop": ("Signal", "your messaging app", "app"),
+    "telegram-desktop": ("Telegram", "a messaging app", "app"),
+    "thunderbird": ("Thunderbird", "your email client", "app"),
+    "evolution": ("Evolution", "your email client", "app"),
+    "zoom": ("Zoom", "a video call", "media"),
+    # Media
+    "spotify": ("Spotify", "your music player", "media"),
+    "mpv": ("mpv", "a video player", "media"),
+    "vlc": ("VLC", "a video player", "media"),
+    "obs": ("OBS", "screen recording or streaming", "media"),
+    "ffmpeg": ("ffmpeg", "converting audio or video", "media"),
+    "pipewire": ("PipeWire", "the audio system", "system"),
+    "pipewire-pulse": ("PipeWire", "the audio system", "system"),
+    "wireplumber": ("WirePlumber", "the audio session manager", "system"),
+    "pulseaudio": ("PulseAudio", "the audio system", "system"),
+    # Desktop and Omarchy
+    "Hyprland": ("Hyprland", "your window manager -- it draws every window", "system"),
+    "quickshell": ("Omarchy's shell", "the bar, notifications, and popups", "system"),
+    "omarchy-shell": ("Omarchy's shell", "the bar, notifications, and popups", "system"),
+    "xdg-desktop-portal": ("the desktop portal", "how apps ask to share screens and open files", "system"),
+    "xdg-desktop-portal-hyprland": ("the Hyprland portal", "screen sharing and screenshots", "system"),
+    "Xwayland": ("Xwayland", "the compatibility layer for older X11 apps", "system"),
+    "swaybg": ("swaybg", "your wallpaper", "system"),
+    "hyprpaper": ("hyprpaper", "your wallpaper", "system"),
+    "mako": ("Mako", "what draws desktop notifications", "system"),
+    "waybar": ("Waybar", "the status bar", "system"),
+    "walker": ("Walker", "the app launcher", "system"),
+    "wofi": ("Wofi", "the app launcher", "system"),
+    "nautilus": ("Files", "the file manager", "app"),
+    "thunar": ("Thunar", "the file manager", "app"),
+    # Dev tooling
+    "node": ("Node", "a JavaScript program -- often a dev server, a build, or an editor extension", "dev"),
+    "bun": ("Bun", "a JavaScript program -- often a dev server or a build", "dev"),
+    "deno": ("Deno", "a JavaScript program", "dev"),
+    "esbuild": ("esbuild", "bundling JavaScript", "dev"),
+    "vite": ("Vite", "a development server", "dev"),
+    "webpack": ("webpack", "bundling JavaScript", "dev"),
+    "tsserver": ("the TypeScript server", "type-checking in your editor", "dev"),
+    "typescript-language-server": ("the TypeScript server", "type-checking in your editor", "dev"),
+    "rust-analyzer": ("rust-analyzer", "type-checking Rust in your editor", "dev"),
+    "gopls": ("gopls", "type-checking Go in your editor", "dev"),
+    "pyright": ("Pyright", "type-checking Python in your editor", "dev"),
+    "lua-language-server": ("the Lua language server", "type-checking Lua in your editor", "dev"),
+    "clangd": ("clangd", "type-checking C/C++ in your editor", "dev"),
+    "ruby": ("Ruby", "a Ruby program", "dev"),
+    "ruby-lsp": ("Ruby LSP", "type-checking Ruby in your editor", "dev"),
+    "puma": ("Puma", "a Ruby web server", "dev"),
+    "rails": ("Rails", "a Ruby web app", "dev"),
+    "sidekiq": ("Sidekiq", "background jobs for a Ruby app", "dev"),
+    "python": ("Python", "a Python program", "dev"),
+    "python3": ("Python", "a Python program", "dev"),
+    "java": ("Java", "a Java program", "dev"),
+    "gradle": ("Gradle", "a Java build", "dev"),
+    "cargo": ("Cargo", "a Rust build", "dev"),
+    "rustc": ("rustc", "compiling Rust", "dev"),
+    "gcc": ("GCC", "compiling C or C++", "dev"),
+    "cc1plus": ("GCC", "compiling C++", "dev"),
+    "cc1": ("GCC", "compiling C", "dev"),
+    "clang": ("Clang", "compiling C or C++", "dev"),
+    "ld": ("the linker", "finishing a build", "dev"),
+    "make": ("make", "a build", "dev"),
+    "ninja": ("Ninja", "a build", "dev"),
+    "go": ("Go", "a Go build or program", "dev"),
+    "git": ("Git", "a version-control operation", "dev"),
+    "rg": ("ripgrep", "searching through files", "dev"),
+    "fd": ("fd", "searching for files", "dev"),
+    "docker": ("Docker", "a container", "dev"),
+    "dockerd": ("Docker", "the container engine", "dev"),
+    "containerd": ("containerd", "the container engine", "dev"),
+    "podman": ("Podman", "a container", "dev"),
+    "qemu-system-x86_64": ("QEMU", "a virtual machine", "dev"),
+    "postgres": ("PostgreSQL", "a database", "dev"),
+    "mysqld": ("MySQL", "a database", "dev"),
+    "mariadbd": ("MariaDB", "a database", "dev"),
+    "redis-server": ("Redis", "a database", "dev"),
+    "mongod": ("MongoDB", "a database", "dev"),
+    # Background services
+    "systemd": ("systemd", "the service manager that starts everything", "system"),
+    "systemd-journald": ("the system log", "writing log files", "system"),
+    "systemd-udevd": ("udev", "handling hardware as it appears", "system"),
+    "systemd-oomd": ("systemd-oomd", "the out-of-memory guard", "system"),
+    "systemd-resolved": ("systemd-resolved", "what looks up domain names", "system"),
+    "systemd-timesyncd": ("time sync", "keeping your clock correct", "system"),
+    "NetworkManager": ("NetworkManager", "what manages your network connection", "system"),
+    "iwd": ("iwd", "what manages your Wi-Fi connection", "system"),
+    "wpa_supplicant": ("wpa_supplicant", "what manages your Wi-Fi connection", "system"),
+    "bluetoothd": ("the Bluetooth service", "what manages your Bluetooth devices", "system"),
+    "tailscaled": ("Tailscale", "what connects you to your private network", "system"),
+    "dbus-daemon": ("D-Bus", "how apps talk to each other", "system"),
+    "dbus-broker": ("D-Bus", "how apps talk to each other", "system"),
+    "polkitd": ("polkit", "the permission prompts", "system"),
+    "gpg-agent": ("the GPG agent", "what holds your encryption keys", "system"),
+    "ssh-agent": ("the SSH agent", "what holds your SSH keys", "system"),
+    "1password": ("1Password", "your password manager", "app"),
+    "1password-gui": ("1Password", "your password manager", "app"),
+    "dropbox": ("Dropbox", "syncing your files to the cloud", "system"),
+    "syncthing": ("Syncthing", "syncing your files between machines", "system"),
+    "packagekitd": ("PackageKit", "checking for software updates", "system"),
+    "pacman": ("pacman", "installing or updating software", "system"),
+    "fwupd": ("fwupd", "checking for firmware updates", "system"),
+    "tracker-miner-fs": ("the file indexer", "indexing your files so search is fast", "system"),
+    "tracker-miner-fs-3": ("the file indexer", "indexing your files so search is fast", "system"),
+    "baloo_file": ("the file indexer", "indexing your files so search is fast", "system"),
+    "updatedb": ("updatedb", "indexing your files so `locate` is fast", "system"),
+    "mandb": ("mandb", "rebuilding the manual-page index", "system"),
+    "btop": ("btop", "the system monitor you opened", "app"),
+    "htop": ("htop", "the system monitor you opened", "app"),
+    "top": ("top", "the system monitor you opened", "app"),
+}
+
+# Kernel threads. Matched as prefixes because they carry a worker number.
+KERNEL_THREADS = {
+    "kworker": ("kernel workers", "the kernel doing housekeeping"),
+    "ksoftirqd": ("ksoftirqd", "the kernel handling hardware interrupts"),
+    "kswapd": ("kswapd", "the kernel moving memory to and from swap"),
+    "kcompactd": ("kcompactd", "the kernel tidying up memory"),
+    "khugepaged": ("khugepaged", "the kernel tidying up memory"),
+    "rcu_": ("rcu", "internal kernel bookkeeping"),
+    "migration": ("migration", "the kernel moving work between CPU cores"),
+    "irq/": ("irq", "the kernel handling hardware interrupts"),
+    "nvme": ("nvme", "the kernel talking to your SSD"),
+    "jbd2": ("jbd2", "the filesystem writing its journal"),
+    "btrfs": ("btrfs", "filesystem housekeeping"),
+    "z_wr": ("zfs", "filesystem housekeeping"),
+    "scsi_eh": ("scsi_eh", "the kernel recovering a disk"),
+}
+
+# Cleaned off the end of a binary name before we look it up.
+SUFFIXES = ("-wrapped", "-bin", "-real", ".bin", ".real", ".AppImage")
+
+
+def friendly(name):
+    """Return (display, description, kind) for a raw process name."""
+    for prefix, (disp, desc) in KERNEL_THREADS.items():
+        if name.startswith(prefix):
+            return disp, desc, "kernel"
+    if name in PROCESSES:
+        return PROCESSES[name]
+    # Unknown: show the raw name but say plainly that we don't recognise it,
+    # rather than inventing a description for it.
+    return name, "", "unknown"
+
+
+def normalize(name):
+    """Strip the packaging noise Arch and Flatpak leave on binary names."""
+    name = name.strip()
+    if name.startswith("."):
+        name = name[1:]
+    for suffix in SUFFIXES:
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    return name
+
+
+# ---------------------------------------------------------------------------
+# Reading /proc and /sys
+# ---------------------------------------------------------------------------
+
+
+def read(path, default=""):
+    try:
+        with open(path, "rb") as handle:
+            return handle.read().decode("utf-8", "replace")
+    except OSError:
+        return default
+
+
+def read_int(path, default=None):
+    raw = read(path).strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def cpu_totals():
+    """(busy_jiffies, total_jiffies) from the aggregate line of /proc/stat."""
+    for line in read("/proc/stat").splitlines():
+        if line.startswith("cpu "):
+            values = [int(v) for v in line.split()[1:]]
+            total = sum(values)
+            # idle + iowait. Waiting on the disk is not the CPU working.
+            idle = values[3] + (values[4] if len(values) > 4 else 0)
+            return total - idle, total
+    return 0, 0
+
+
+def process_name(pid):
+    """The name a person would recognise, preferring argv[0] over comm.
+
+    comm is truncated at 15 characters by the kernel, so `signal-desktop`
+    survives but `typescript-language-server` does not; argv[0] is whole.
+    Kernel threads have an empty cmdline, so they fall back to comm.
+    """
+    cmdline = read("/proc/%d/cmdline" % pid)
+    argv0 = cmdline.split("\0")[0] if cmdline else ""
+    if argv0:
+        base = os.path.basename(argv0)
+        # Interpreters name themselves, not the script; `python3 manage.py`
+        # is more usefully "python3" than "manage.py", so keep argv[0].
+        if base and not base.startswith("-"):
+            return normalize(base)
+    comm = read("/proc/%d/comm" % pid).strip()
+    return normalize(comm)
+
+
+SELF_PID = os.getpid()
+
+
+def sample_processes():
+    """{pid: {...}} for every process we can see right now.
+
+    Excludes this process. Walking /proc for a few hundred processes costs
+    real CPU, and a monitor that reports itself as the busiest thing on the
+    machine is both wrong and useless.
+    """
+    procs = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == SELF_PID:
+            continue
+        stat = read("/proc/%d/stat" % pid)
+        if not stat:
+            continue
+        # comm is parenthesised and may itself contain spaces and parens, so
+        # the fields after it start at the last ')'.
+        close = stat.rfind(")")
+        if close < 0:
+            continue
+        fields = stat[close + 2 :].split()
+        if len(fields) < 13:
+            continue
+        try:
+            state = fields[0]
+            ticks = int(fields[11]) + int(fields[12])  # utime + stime
+            starttime = int(fields[19])  # ticks since boot when it launched
+        except (ValueError, IndexError):
+            continue
+        rss_pages = 0
+        statm = read("/proc/%d/statm" % pid).split()
+        if len(statm) > 1:
+            try:
+                rss_pages = int(statm[1])
+            except ValueError:
+                rss_pages = 0
+        procs[pid] = {
+            "name": process_name(pid),
+            "ticks": ticks,
+            "started": starttime / HZ,
+            "rss": rss_pages * PAGE,
+            "state": state,
+        }
+    return procs
+
+
+def memory():
+    info = {}
+    for line in read("/proc/meminfo").splitlines():
+        key, _, rest = line.partition(":")
+        try:
+            info[key] = int(rest.split()[0]) * 1024
+        except (ValueError, IndexError):
+            continue
+    total = info.get("MemTotal", 0)
+    available = info.get("MemAvailable", 0)
+    swap_total = info.get("SwapTotal", 0)
+    swap_free = info.get("SwapFree", 0)
+    return {
+        "total": total,
+        "available": available,
+        "used": max(0, total - available),
+        "cached": info.get("Cached", 0),
+        "swapTotal": swap_total,
+        "swapUsed": max(0, swap_total - swap_free),
+    }
+
+
+def pressure():
+    """Pressure Stall Information: the share of time work was blocked.
+
+    `some avg10` is the percentage of the last 10 seconds in which at least one
+    task was stalled waiting for that resource. It is the single most honest
+    "why does this feel slow" number the kernel exposes.
+    """
+    out = {}
+    for kind in ("cpu", "io", "memory"):
+        text = read("/proc/pressure/%s" % kind)
+        for line in text.splitlines():
+            if line.startswith("some"):
+                match = re.search(r"avg10=([\d.]+)", line)
+                if match:
+                    out[kind] = float(match.group(1))
+    return out
+
+
+def hwmon_map():
+    paths = {}
+    base = "/sys/class/hwmon"
+    if not os.path.isdir(base):
+        return paths
+    for entry in sorted(os.listdir(base)):
+        path = os.path.join(base, entry)
+        paths.setdefault(read(os.path.join(path, "name")).strip(), path)
+    return paths
+
+
+def power(hwmons):
+    """Battery, AC, and -- where the hardware reports it -- real wattage.
+
+    Two independent numbers, and they mean different things:
+      socWatts   what the CPU/GPU package is burning (AMD APUs report PPT here)
+      drawWatts  what the battery is losing, i.e. the whole laptop
+    Neither is available on every machine, so both are optional.
+    """
+    out = {"onBattery": False, "present": False}
+
+    ac_online = None
+    battery_path = None
+    supply = "/sys/class/power_supply"
+    if os.path.isdir(supply):
+        for entry in sorted(os.listdir(supply)):
+            path = os.path.join(supply, entry)
+            kind = read(os.path.join(path, "type")).strip()
+            if kind == "Mains" and ac_online is None:
+                ac_online = read_int(os.path.join(path, "online"))
+            elif kind == "Battery" and battery_path is None:
+                # Skip peripheral batteries (mice, headsets): they report a
+                # capacity but no charge/energy counters.
+                if os.path.exists(os.path.join(path, "voltage_now")):
+                    battery_path = path
+
+    if ac_online is not None:
+        out["onAc"] = bool(ac_online)
+
+    if battery_path:
+        out["present"] = True
+        status = read(os.path.join(battery_path, "status")).strip()
+        out["status"] = status
+        out["percent"] = read_int(os.path.join(battery_path, "capacity"))
+        out["onBattery"] = status == "Discharging" and not out.get("onAc", False)
+
+        # Batteries report either energy (µWh/µW) or charge (µAh/µA). Handle
+        # both: this machine is a charge-reporting one.
+        watts = None
+        hours = None
+        power_now = read_int(os.path.join(battery_path, "power_now"))
+        energy_now = read_int(os.path.join(battery_path, "energy_now"))
+        if power_now:
+            watts = power_now / 1e6
+            if energy_now:
+                hours = energy_now / power_now
+        else:
+            current = read_int(os.path.join(battery_path, "current_now"))
+            voltage = read_int(os.path.join(battery_path, "voltage_now"))
+            charge = read_int(os.path.join(battery_path, "charge_now"))
+            if current and voltage:
+                watts = abs(current) * voltage / 1e12
+            if current and charge:
+                hours = charge / abs(current)
+        if watts is not None:
+            out["drawWatts"] = round(watts, 1)
+        if hours is not None and status == "Discharging":
+            out["hoursLeft"] = round(hours, 2)
+
+    # SoC package power. On AMD APUs the amdgpu hwmon's PPT covers CPU and GPU
+    # together, which makes it the best single "what is this chip burning"
+    # number available without root. Intel's RAPL counters are root-only.
+    for name in ("amdgpu", "i915", "xe"):
+        path = hwmons.get(name)
+        if not path:
+            continue
+        micro = read_int(os.path.join(path, "power1_average")) or read_int(
+            os.path.join(path, "power1_input")
+        )
+        if micro:
+            out["socWatts"] = round(micro / 1e6, 1)
+            break
+
+    return out
+
+
+def thermals(hwmons):
+    out = {}
+    for name in ("k10temp", "coretemp", "zenpower", "cpu_thermal", "acpitz"):
+        path = hwmons.get(name)
+        if not path:
+            continue
+        # Prefer the labelled package/die sensor over an arbitrary core.
+        best = None
+        for label_file in sorted(f for f in os.listdir(path) if f.endswith("_label")):
+            label = read(os.path.join(path, label_file)).strip()
+            value = read_int(os.path.join(path, label_file.replace("_label", "_input")))
+            if value is None:
+                continue
+            if label in ("Tctl", "Tdie", "Package id 0", "Composite"):
+                best = value
+                break
+            best = max(best or 0, value)
+        if best is None:
+            best = read_int(os.path.join(path, "temp1_input"))
+        if best:
+            out["cpu"] = round(best / 1000)
+            break
+
+    for key, chip in (("gpu", "amdgpu"), ("disk", "nvme")):
+        path = hwmons.get(chip)
+        if not path:
+            continue
+        value = read_int(os.path.join(path, "temp1_input"))
+        if value:
+            out[key] = round(value / 1000)
+    return out
+
+
+def gpu_busy():
+    for card in sorted(os.listdir("/sys/class/drm")) if os.path.isdir("/sys/class/drm") else []:
+        path = "/sys/class/drm/%s/device/gpu_busy_percent" % card
+        value = read_int(path)
+        if value is not None:
+            return value
+    return None
+
+
+def windows_by_pid():
+    """{pid: [window title, ...]} from Hyprland, so we can name what you see.
+
+    Best-effort: a missing or failing hyprctl just means we describe processes
+    without mentioning windows.
+    """
+    try:
+        raw = subprocess.run(
+            ["hyprctl", "-j", "clients"],
+            capture_output=True,
+            timeout=2,
+            text=True,
+        )
+        clients = json.loads(raw.stdout)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return {}
+    out = {}
+    for client in clients:
+        pid = client.get("pid")
+        if isinstance(pid, int) and pid > 0:
+            out.setdefault(pid, []).append(client.get("title") or client.get("class") or "")
+    return out
+
+
+def uptime_seconds():
+    try:
+        return float(read("/proc/uptime").split()[0])
+    except (ValueError, IndexError):
+        return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Saying it in English
+# ---------------------------------------------------------------------------
+
+
+def humanize_bytes(value):
+    gb = value / (1024 ** 3)
+    if gb >= 10:
+        return "%d GB" % round(gb)
+    if gb >= 1:
+        return "%.1f GB" % gb
+    return "%d MB" % round(value / (1024 ** 2))
+
+
+def humanize_hours(hours):
+    minutes = int(round(hours * 60))
+    if minutes < 60:
+        return "%d minutes" % minutes
+    if minutes % 60 == 0:
+        return "%d hours" % (minutes // 60)
+    return "%dh %dm" % (minutes // 60, minutes % 60)
+
+
+def humanize_uptime(seconds):
+    days, rest = divmod(int(seconds), 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes = rest // 60
+    if days:
+        return "%d day%s" % (days, "" if days == 1 else "s")
+    if hours:
+        return "%d hour%s" % (hours, "" if hours == 1 else "s")
+    return "%d minutes" % minutes
+
+
+def humanize_cores(cores):
+    """Describe CPU use in cores, because 'percent' begs 'percent of what'."""
+    if cores >= 1.9:
+        return "about %.1f of your %d CPU cores" % (cores, NCPU)
+    if cores >= 0.9:
+        return "a whole CPU core"
+    if cores >= 0.55:
+        return "most of one CPU core"
+    if cores >= 0.35:
+        return "about half a CPU core"
+    if cores >= 0.12:
+        return "a fraction of one CPU core"
+    return "almost no CPU"
+
+
+PLURALS = {"process": "processes"}
+
+
+def lead(name):
+    """Capitalise a display name only when it starts with an article.
+
+    "the Bluetooth service" must become "The Bluetooth service" at the head of
+    a sentence, but lowercase proper names like "btop" and "quickshell" are
+    spelled that way on purpose and must be left alone.
+    """
+    for article in ("the ", "a ", "an "):
+        if name.startswith(article):
+            return name[0].upper() + name[1:]
+    return name
+
+
+def plural(count, word):
+    if count == 1:
+        return "%d %s" % (count, word)
+    return "%d %s" % (count, PLURALS.get(word, word + "s"))
+
+
+def humanize_duration(seconds):
+    """Short spans, for 'has been busy for ...'. Uptime has its own units."""
+    seconds = int(seconds)
+    if seconds < 90:
+        return "%d seconds" % seconds
+    minutes = seconds // 60
+    if minutes < 90:
+        return "%s" % plural(minutes, "minute")
+    hours = minutes / 60
+    if hours < 24:
+        return "%.0f hours" % hours
+    return "%s" % plural(int(hours // 24), "day")
+
+
+class Narrator:
+    """Turns one sample into sentences.
+
+    Every rule here is deterministic and reads only from the sample, so the
+    same numbers always produce the same words.
+    """
+
+    def __init__(self, sample):
+        self.s = sample
+        self.lines = []
+        self.concerns = []
+
+    def add(self, section, text, tone="normal", title=""):
+        self.lines.append({"section": section, "text": text, "tone": tone, "title": title})
+
+    # -- overall ----------------------------------------------------------
+
+    def state(self):
+        cpu = self.s["cpuPercent"]
+        mem = self.s["memory"]
+        mem_pct = 100 * mem["used"] / mem["total"] if mem["total"] else 0
+        psi = self.s["pressure"]
+        if psi.get("io", 0) > 25 or psi.get("memory", 0) > 15 or mem_pct > 92:
+            return "strained"
+        if cpu >= 65:
+            return "working"
+        if cpu >= 20:
+            return "busy"
+        return "quiet"
+
+    def headline(self, state, flagged):
+        # A machine can be statistically idle and still have one thing wedged.
+        # Leading with "mostly idle" there would bury the only sentence on the
+        # page worth acting on.
+        if flagged and state in ("quiet", "busy"):
+            return {
+                "quiet": "Mostly idle, but something is stuck.",
+                "busy": "Busy, and something is stuck.",
+            }[state]
+        return {
+            "quiet": "Your computer is mostly idle.",
+            "busy": "Your computer is busy, and coping fine.",
+            "working": "Your computer is working hard.",
+            "strained": "Your computer is under strain.",
+        }[state]
+
+    def summary(self, state):
+        cpu = self.s["cpuPercent"]
+        mem = self.s["memory"]
+        free = humanize_bytes(mem["available"])
+        used_cores = cpu / 100 * NCPU
+        if state == "quiet":
+            # The reassuring tail is only true if nothing was flagged below.
+            tail = (
+                "The one thing worth looking at is further down."
+                if self.concerns
+                else "Nothing is competing for the machine."
+            )
+            return "Only %d%% of the CPU is in use and %s of memory is free. %s" % (
+                round(cpu),
+                free,
+                tail,
+            )
+        if state == "busy":
+            return (
+                "About %d%% of the CPU is in use -- roughly %.1f of your %d cores -- "
+                "with %s of memory still free." % (round(cpu), used_cores, NCPU, free)
+            )
+        if state == "working":
+            return (
+                "%d%% of the CPU is in use, about %.1f of your %d cores. That is a lot, "
+                "but it is what the cores are for." % (round(cpu), used_cores, NCPU)
+            )
+        return (
+            "%d%% of the CPU is in use and %s of memory is free. Something below is "
+            "getting in its own way." % (round(cpu), free)
+        )
+
+    # -- processes --------------------------------------------------------
+
+    def describe_group(self, group, rank):
+        display, description, kind = group["friendly"]
+        cores = group["cores"]
+        pids = group["pids"]
+        windows = group["windows"]
+
+        # Lead with what it is, since not recognising the name is the whole
+        # reason someone opens this panel.
+        display = lead(display)
+        if description:
+            subject = "**%s** (%s)" % (display, description)
+        elif kind == "unknown":
+            subject = "**%s** (not a program I recognise)" % display
+        else:
+            subject = "**%s**" % display
+
+        bits = []
+        superlative = "is the busiest thing running" if rank == 0 else "is using"
+        if rank == 0:
+            bits.append("%s %s -- %s" % (subject, superlative, humanize_cores(cores)))
+        else:
+            bits.append("%s is using %s" % (subject, humanize_cores(cores)))
+
+        bits.append("and %s of memory" % humanize_bytes(group["mem"]))
+
+        detail = []
+        if pids > 3:
+            detail.append("spread across %s" % plural(pids, "process"))
+        if windows:
+            detail.append(plural(windows, "window"))
+        sentence = " ".join(bits)
+        if detail:
+            sentence += " (%s)" % ", ".join(detail)
+        sentence += "."
+
+        # The "should I care" half. This is the part btop cannot tell you.
+        note = self.process_note(group, kind, cores)
+        if note:
+            sentence += " " + note
+        return sentence
+
+    def process_note(self, group, kind, cores):
+        sustained = group["sustained"]
+        if kind == "browser":
+            if cores >= 2:
+                return (
+                    "Browsers get this busy for a reason -- usually a video, a video call, "
+                    "or one page running away with itself. Closing the noisiest tab is the fix."
+                )
+            return "That is ordinary for a browser with tabs open."
+        if kind == "agent":
+            return "That is what it looks like while it is thinking; it will drop back on its own."
+        if kind == "dev":
+            if sustained:
+                return "Builds and dev servers run hot on purpose. It should stop when the work does."
+            return "That is a build or a dev tool doing its job."
+        if kind == "kernel":
+            return "This is the operating system itself, not an app. It is not something to act on."
+        if kind == "media":
+            return "Expected while something is playing or recording."
+        if kind == "system":
+            # A background daemon is meant to sit idle. One burning a whole
+            # core is not "working", it is stuck, and saying otherwise would
+            # talk someone out of the one thing worth acting on.
+            if cores >= 0.85:
+                return (
+                    "This is a background service, not something you opened -- it is "
+                    "supposed to sit idle. Using this much CPU means it is stuck, not busy."
+                )
+            return "Background system work; it settles down by itself."
+        if kind == "unknown":
+            return (
+                "If you did not start it and do not recognise the name, that is worth "
+                "looking up before you kill it."
+            )
+        return ""
+
+    def narrate_processes(self, groups):
+        # Anything under a tenth of a core is noise; naming it would bury the
+        # things that actually matter.
+        interesting = [g for g in groups if g["cores"] >= 0.1][:5]
+        if not interesting:
+            self.add(
+                "WHAT'S RUNNING",
+                "Nothing is using a meaningful amount of CPU right now. Every program "
+                "on the machine is sitting idle, waiting for you.",
+                tone="good",
+            )
+            return
+        for rank, group in enumerate(interesting):
+            kind = group["friendly"][2]
+            expected = kind in ("dev", "agent", "media")
+            # A background service burning a core is the finding, not the
+            # footnote: match the tone to what the sentence actually says.
+            if kind == "system" and group["cores"] >= 0.85:
+                tone = "warn"
+            elif group["sustained"] and group["cores"] >= 0.85 and not expected:
+                tone = "warn"
+            elif kind in ("kernel", "system"):
+                tone = "dim"
+            else:
+                tone = "normal"
+            self.add("WHAT'S RUNNING", self.describe_group(group, rank), tone=tone)
+
+    # -- memory -----------------------------------------------------------
+
+    def narrate_memory(self, groups):
+        mem = self.s["memory"]
+        total, used, available = mem["total"], mem["used"], mem["available"]
+        pct = 100 * used / total if total else 0
+        free_text = humanize_bytes(available)
+
+        if pct < 60:
+            self.add(
+                "MEMORY",
+                "You are using %s of %s of memory, and %s is still free. "
+                "Memory is not your problem."
+                % (humanize_bytes(used), humanize_bytes(total), free_text),
+                tone="good",
+            )
+        elif pct < 85:
+            self.add(
+                "MEMORY",
+                "You are using %s of %s of memory, with %s free. That is comfortable, "
+                "but a big new app would notice."
+                % (humanize_bytes(used), humanize_bytes(total), free_text),
+            )
+        else:
+            self.add(
+                "MEMORY",
+                "Memory is tight: %s of %s in use, only %s free. Expect the machine to "
+                "start pushing things to swap, which is when it feels slow."
+                % (humanize_bytes(used), humanize_bytes(total), free_text),
+                tone="bad",
+            )
+            self.concerns.append("Memory is nearly full.")
+
+        hog = max(groups, key=lambda g: g["mem"], default=None)
+        if hog and hog["mem"] > total * 0.12:
+            display, _, _ = hog["friendly"]
+            self.add(
+                "MEMORY",
+                "%s is holding the most: %s, or about %d%% of everything you have."
+                % (lead(display), humanize_bytes(hog["mem"]), round(100 * hog["mem"] / total)),
+            )
+
+        if mem["swapUsed"] > 256 * 1024 ** 2:
+            self.add(
+                "MEMORY",
+                "%s has been pushed out to swap. Swap is disk pretending to be memory, "
+                "so anything that needs it back will stutter."
+                % humanize_bytes(mem["swapUsed"]),
+                tone="warn",
+            )
+
+    # -- power ------------------------------------------------------------
+
+    def narrate_power(self, groups):
+        p = self.s["power"]
+        if not p.get("present") and "socWatts" not in p:
+            return
+
+        soc = p.get("socWatts")
+        draw = p.get("drawWatts")
+        top = groups[0] if groups else None
+
+        if p.get("onBattery"):
+            parts = ["You are on battery"]
+            if p.get("percent") is not None:
+                parts.append("at %d%%" % p["percent"])
+            sentence = " ".join(parts) + "."
+            if draw:
+                sentence += " The whole laptop is drawing about %.1f watts" % draw
+                if p.get("hoursLeft"):
+                    sentence += ", which is roughly %s of use left" % humanize_hours(p["hoursLeft"])
+                sentence += "."
+            tone = "warn" if draw and draw > 25 else "normal"
+            self.add("ENERGY", sentence, tone=tone)
+        elif p.get("onAc"):
+            status = p.get("status", "")
+            if status == "Charging":
+                self.add("ENERGY", "You are plugged in and charging, so nothing here costs you runtime.", tone="good")
+            else:
+                self.add(
+                    "ENERGY",
+                    "You are plugged in%s, so nothing here is costing you battery."
+                    % (" and topped up" if (p.get("percent") or 0) >= 95 else ""),
+                    tone="good",
+                )
+
+        if soc:
+            sentence = "Your processor and graphics are burning about %.0f watts between them." % soc
+            if soc >= 45:
+                sentence += " That is close to flat out -- expect fans and a warm keyboard."
+                tone = "warn"
+            elif soc >= 20:
+                sentence += " That is a working, not resting, chip."
+                tone = "normal"
+            else:
+                sentence += " That is close to resting."
+                tone = "good"
+            self.add("ENERGY", sentence, tone=tone)
+
+            # Attribute the draw honestly: CPU share is a real signal about who
+            # is responsible, but it is not a per-process wattmeter, and saying
+            # otherwise would be inventing a number.
+            if top and top["cores"] >= 0.5 and soc >= 15:
+                share = 100 * top["cores"] / max(self.s["cpuPercent"] / 100 * NCPU, 0.01)
+                if share >= 40:
+                    kind = top["friendly"][2]
+                    remedy = (
+                        "restarting it is what would bring the number down"
+                        if kind in ("system", "kernel")
+                        else "closing it is what would bring the number down"
+                    )
+                    self.add(
+                        "ENERGY",
+                        "%s accounts for most of the CPU work behind that, so %s."
+                        % (lead(top["friendly"][0]), remedy),
+                    )
+
+        gpu = self.s.get("gpuBusy")
+        if gpu is not None and gpu >= 40:
+            self.add(
+                "ENERGY",
+                "The graphics chip is %d%% busy. Something is drawing hard -- a video, a "
+                "game, a call, or a page with heavy animation." % gpu,
+            )
+
+        temp = self.s["thermals"].get("cpu")
+        if temp and temp >= 90:
+            self.add(
+                "ENERGY",
+                "The processor is at %d°C. It will start slowing itself down to cool off, "
+                "which is why a hot machine can feel sluggish even when it is not busy." % temp,
+                tone="bad",
+            )
+            self.concerns.append("The processor is running hot.")
+        elif temp and temp >= 80:
+            self.add(
+                "ENERGY",
+                "The processor is at %d°C -- warm, but within what it is designed for." % temp,
+                tone="warn",
+            )
+
+    # -- the "is anything wrong" section ----------------------------------
+
+    def narrate_health(self, groups, sample):
+        psi = self.s["pressure"]
+        found = False
+
+        io = psi.get("io", 0)
+        if io >= 25:
+            self.add(
+                "WORTH A LOOK",
+                "Programs spent about %d%% of the last ten seconds waiting on the disk "
+                "rather than running. This is the usual reason a machine feels slow while "
+                "the CPU looks idle." % round(io),
+                tone="bad",
+            )
+            self.concerns.append("Things are waiting on the disk.")
+            found = True
+
+        mem_psi = psi.get("memory", 0)
+        if mem_psi >= 10:
+            self.add(
+                "WORTH A LOOK",
+                "Programs spent about %d%% of the last ten seconds waiting for memory. "
+                "Closing something large would help immediately." % round(mem_psi),
+                tone="bad",
+            )
+            self.concerns.append("Things are waiting on memory.")
+            found = True
+
+        cpu_psi = psi.get("cpu", 0)
+        if cpu_psi >= 40:
+            self.add(
+                "WORTH A LOOK",
+                "Programs spent about %d%% of the last ten seconds queued up waiting for "
+                "a free CPU core. More is being asked of the machine than it can run at "
+                "once." % round(cpu_psi),
+                tone="warn",
+            )
+            found = True
+
+        for group in groups:
+            if not group["sustained"]:
+                continue
+            kind = group["friendly"][2]
+            if kind in ("dev", "agent", "media", "kernel"):
+                continue
+            # Not 1.0: a process pegged at exactly one core measures 0.99
+            # as often as 1.00, and rounding it out of the report is how a
+            # genuine runaway gets missed every other refresh.
+            if group["cores"] < 0.85:
+                continue
+            self.add(
+                "WORTH A LOOK",
+                "%s has been running at %s continuously for %s. If you are not doing "
+                "anything that would explain it, that is a program stuck in a loop -- "
+                "quitting and reopening it usually fixes it."
+                % (
+                    lead(group["friendly"][0]),
+                    humanize_cores(group["cores"]),
+                    humanize_duration(group["sustainedFor"]),
+                ),
+                tone="warn",
+            )
+            self.concerns.append("%s has been pegged for a while." % lead(group["friendly"][0]))
+            found = True
+
+        stuck = sample.get("stuck", [])
+        if stuck:
+            names = ", ".join(sorted({friendly(n)[0] for n in stuck}))
+            self.add(
+                "WORTH A LOOK",
+                "%s %s stuck waiting on hardware -- a disk, a USB device, or a network "
+                "mount that stopped answering. These cannot be killed until whatever they "
+                "are waiting for responds."
+                % (names, "is" if len(stuck) == 1 else "are"),
+                tone="warn",
+            )
+            found = True
+
+        zombies = sample.get("zombies", 0)
+        if zombies >= 10:
+            self.add(
+                "WORTH A LOOK",
+                "There are %d finished programs whose parents never cleaned them up. "
+                "They use no CPU or memory, but a growing pile means some program is "
+                "misbehaving." % zombies,
+                tone="warn",
+            )
+            found = True
+
+        if not found:
+            self.add(
+                "WORTH A LOOK",
+                "Nothing looks stuck, starved, or running away. Whatever is busy is busy "
+                "because you asked it to be.",
+                tone="good",
+            )
+
+    def run(self, groups, sample):
+        state = self.state()
+        self.narrate_processes(groups)
+        self.narrate_memory(groups)
+        self.narrate_power(groups)
+        # Health runs before the headline so the headline can admit that
+        # something is wrong even when the averages look calm.
+        self.narrate_health(groups, sample)
+
+        bar = {"quiet": "Quiet", "busy": "Busy", "working": "Working", "strained": "Strained"}[state]
+        if self.concerns and state in ("quiet", "busy"):
+            bar = "Stuck"
+        return {
+            "state": state,
+            "barLabel": bar,
+            "headline": self.headline(state, bool(self.concerns)),
+            "summary": self.summary(state),
+            "lines": self.lines,
+            "concerns": self.concerns,
+            "cpuPercent": round(self.s["cpuPercent"], 1),
+            "memPercent": round(
+                100 * self.s["memory"]["used"] / self.s["memory"]["total"], 1
+            )
+            if self.s["memory"]["total"]
+            else 0,
+            "power": self.s["power"],
+            "thermals": self.s["thermals"],
+            "uptime": humanize_uptime(self.s["uptime"]),
+            "cores": NCPU,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Sampling loop
+# ---------------------------------------------------------------------------
+
+
+class Sampler:
+    def __init__(self):
+        self.prev_procs = None
+        self.prev_cpu = None
+        self.prev_time = None
+        # name -> how many consecutive samples it has been busy for.
+        self.streaks = {}
+        self.hwmons = hwmon_map()
+
+    def collect(self, interval_hint):
+        now = time.monotonic()
+        procs = sample_processes()
+        busy, total = cpu_totals()
+
+        elapsed = (now - self.prev_time) if self.prev_time else interval_hint
+        if elapsed <= 0:
+            elapsed = interval_hint
+
+        if self.prev_cpu and total > self.prev_cpu[1]:
+            cpu_percent = 100.0 * (busy - self.prev_cpu[0]) / (total - self.prev_cpu[1])
+        else:
+            cpu_percent = 0.0
+        cpu_percent = max(0.0, min(100.0, cpu_percent))
+
+        # Group by program, not by process: Chrome is one thing to a person
+        # even though it is forty processes to the kernel.
+        wins = windows_by_pid()
+        up = uptime_seconds()
+        groups = {}
+        zombies = 0
+        stuck = []
+        for pid, proc in procs.items():
+            if proc["state"] == "Z":
+                zombies += 1
+                continue
+            if proc["state"] == "D":
+                stuck.append(proc["name"])
+
+            cores = 0.0
+            if self.prev_procs:
+                prev = self.prev_procs.get(pid)
+                # A recycled pid would show a negative delta; treat it as new.
+                if prev and prev["name"] == proc["name"] and proc["ticks"] >= prev["ticks"]:
+                    cores = (proc["ticks"] - prev["ticks"]) / HZ / elapsed
+
+            # Lifetime average load: total CPU burned divided by how long the
+            # process has existed. A watch loop needs three samples to call
+            # something sustained, but this catches a process that has been
+            # spinning since before we started looking -- on the first sample.
+            age = max(1.0, up - proc["started"])
+            lifetime = (proc["ticks"] / HZ) / age
+
+            group = groups.setdefault(
+                proc["name"],
+                {
+                    "name": proc["name"],
+                    "cores": 0.0,
+                    "mem": 0,
+                    "pids": 0,
+                    "windows": 0,
+                    "lifetime": 0.0,
+                    "age": 0.0,
+                },
+            )
+            group["cores"] += cores
+            group["mem"] += proc["rss"]
+            group["pids"] += 1
+            group["windows"] += len(wins.get(pid, []))
+            group["lifetime"] += lifetime
+            group["age"] = max(group["age"], age)
+
+        ranked = sorted(groups.values(), key=lambda g: g["cores"], reverse=True)
+
+        # Track how long each program has been busy, so we can tell "busy right
+        # now" apart from "has been pegged since you sat down".
+        seen = set()
+        for group in ranked:
+            name = group["name"]
+            seen.add(name)
+            if group["cores"] >= 0.85:
+                self.streaks[name] = self.streaks.get(name, 0) + 1
+            else:
+                self.streaks.pop(name, None)
+        for name in list(self.streaks):
+            if name not in seen:
+                del self.streaks[name]
+
+        for group in ranked:
+            streak = self.streaks.get(group["name"], 0)
+            group["friendly"] = friendly(group["name"])
+            # Two ways to earn "sustained": three consecutive busy samples, so
+            # a one-off spike is never flagged; or a lifetime average that is
+            # already high, which catches a process that was spinning before
+            # this program started watching.
+            long_running = group["cores"] >= 0.7 and group["lifetime"] >= 0.4
+            group["sustained"] = streak >= 3 or long_running
+            group["sustainedFor"] = (
+                max(streak * elapsed, group["age"]) if long_running else streak * elapsed
+            )
+
+        self.prev_procs = procs
+        self.prev_cpu = (busy, total)
+        self.prev_time = now
+
+        sample = {
+            "cpuPercent": cpu_percent,
+            "memory": memory(),
+            "pressure": pressure(),
+            "power": power(self.hwmons),
+            "thermals": thermals(self.hwmons),
+            "gpuBusy": gpu_busy(),
+            "uptime": uptime_seconds(),
+            "zombies": zombies,
+            "stuck": stuck,
+        }
+        return sample, ranked
+
+    def report(self, interval_hint):
+        sample, groups = self.collect(interval_hint)
+        report = Narrator(sample).run(groups, sample)
+        report["ts"] = int(time.time())
+        return report
+
+
+def render_text(report):
+    out = ["", report["headline"], "  " + report["summary"], ""]
+    section = None
+    for line in report["lines"]:
+        if line["section"] != section:
+            section = line["section"]
+            out.append(section)
+        text = re.sub(r"\*\*(.+?)\*\*", r"\1", line["text"])
+        out.append("  - " + text)
+    out.append("")
+    return "\n".join(out)
+
+
+def main():
+    args = sys.argv[1:]
+    watch = "--watch" in args
+    as_text = "--text" in args
+
+    interval = 5.0
+    for i, arg in enumerate(args):
+        if arg == "--interval" and i + 1 < len(args):
+            try:
+                interval = max(1.0, float(args[i + 1]))
+            except ValueError:
+                pass
+
+    sampler = Sampler()
+    # The first sample has no previous one to diff against, so every CPU
+    # number would be zero. Prime it, wait, then report for real.
+    sampler.collect(interval)
+    time.sleep(min(interval, 1.0))
+
+    while True:
+        report = sampler.report(interval)
+        if as_text:
+            print(render_text(report), flush=True)
+        else:
+            print(json.dumps(report), flush=True)
+        if not watch:
+            return
+        time.sleep(interval)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (BrokenPipeError, KeyboardInterrupt):
+        pass

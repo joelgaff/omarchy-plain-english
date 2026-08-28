@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "id": "joel.plain-english",
+  "name": "Plain English",
+  "version": "1.0.0",
+  "author": "Joel",
+  "license": "MIT",
+  "description": "Your system statistics as sentences: what each program is doing, whether it is normal, and what is actually worth acting on.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Plain English",
+    "description": "Reads CPU, memory, power, and pressure, and explains them in sentences instead of numbers.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "intervalSec": 5,
+      "showLabel": true
+    },
+    "schema": [
+      {
+        "key": "intervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 2,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 5
+      },
+      {
+        "key": "showLabel",
+        "type": "boolean",
+        "label": "Show the state word next to the icon",
+        "defaultValue": true
+      }
+    ]
+  }
+}
