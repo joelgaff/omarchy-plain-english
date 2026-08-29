@@ -13,8 +13,14 @@ import Quickshell.Io
 QtObject {
   id: root
 
-  readonly property string pluginDir: (Quickshell.env("HOME") || "")
-    + "/.config/omarchy/plugins/joel.plain-english"
+  // Derived from this file's own location rather than a hardcoded install
+  // path: the plugin still works when it is cloned under a different
+  // directory name, symlinked from a checkout, or renamed.
+  readonly property string pluginDir: {
+    var dir = Qt.resolvedUrl(".").toString()
+    if (dir.indexOf("file://") === 0) dir = dir.substring(7)
+    return dir.replace(/\/$/, "")
+  }
 
   // Seconds between readings. Widgets write this from their settings; the
   // helper is restarted when it changes.

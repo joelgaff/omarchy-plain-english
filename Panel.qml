@@ -13,8 +13,8 @@ import qs.Ui
 // (`plain-english-activity --text`) without going through Quickshell at all.
 Panel {
   id: root
-  moduleName: "joel.plain-english"
-  ipcTarget: "joel.plain-english"
+  moduleName: "joelgaff.plain-english"
+  ipcTarget: "joelgaff.plain-english"
 
   readonly property bool showLabel: setting("showLabel", true) === true
   readonly property bool vertical: bar ? bar.vertical : false

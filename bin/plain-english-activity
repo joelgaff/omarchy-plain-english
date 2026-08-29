@@ -222,6 +222,11 @@ def friendly(name):
     return name, "", "unknown"
 
 
+# A bare program name: no whitespace, no flags, nothing argument-shaped, and
+# short enough to be a filename rather than a command line.
+SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+@-]{0,31}$")
+
+
 def normalize(name):
     """Strip the packaging noise Arch and Flatpak leave on binary names."""
     name = name.strip()
@@ -278,9 +283,15 @@ def process_name(pid):
     argv0 = cmdline.split("\0")[0] if cmdline else ""
     if argv0:
         base = os.path.basename(argv0)
-        # Interpreters name themselves, not the script; `python3 manage.py`
-        # is more usefully "python3" than "manage.py", so keep argv[0].
-        if base and not base.startswith("-"):
+        # Chrome and other setproctitle users rewrite their argv into one
+        # blob, so argv[0] comes back as the whole command line -- flags,
+        # tokens, and OAuth secrets included. Anything that does not look
+        # like a bare program name falls through to comm, which the kernel
+        # keeps clean. Never render an argument: they carry credentials.
+        if SAFE_NAME.match(base):
+            # Interpreters name themselves, not the script; `python3
+            # manage.py` is more usefully "python3" than "manage.py", so
+            # argv[0] is the right field to read when it is trustworthy.
             return normalize(base)
     comm = read("/proc/%d/comm" % pid).strip()
     return normalize(comm)
@@ -1020,7 +1031,7 @@ class Narrator:
                 "%s %s stuck waiting on hardware -- a disk, a USB device, or a network "
                 "mount that stopped answering. These cannot be killed until whatever they "
                 "are waiting for responds."
-                % (names, "is" if len(stuck) == 1 else "are"),
+                % (lead(names), "is" if len(set(stuck)) == 1 else "are"),
                 tone="warn",
             )
             found = True
@@ -1116,7 +1127,10 @@ class Sampler:
             if proc["state"] == "Z":
                 zombies += 1
                 continue
-            if proc["state"] == "D":
+            # Uninterruptible sleep means blocked on hardware -- but kernel
+            # threads pass through D-state constantly as normal operation, so
+            # counting them would report a fault on every idle machine.
+            if proc["state"] == "D" and friendly(proc["name"])[2] != "kernel":
                 stuck.append(proc["name"])
 
             cores = 0.0
