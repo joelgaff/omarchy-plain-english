@@ -16,6 +16,7 @@ debuggable from a terminal.
 import json
 import os
 import re
+import select
 import subprocess
 import sys
 import time
@@ -518,6 +519,9 @@ def gpu_busy():
 
 def windows_by_pid():
     """{pid: [window title, ...]} from Hyprland, so we can name what you see.
+
+    Costs a subprocess spawn, and window counts only ever appear in the popup,
+    so the caller skips this entirely while the panel is closed.
 
     Best-effort: a missing or failing hyprctl just means we describe processes
     without mentioning windows.
@@ -1101,7 +1105,7 @@ class Sampler:
         self.streaks = {}
         self.hwmons = hwmon_map()
 
-    def collect(self, interval_hint):
+    def collect(self, interval_hint, with_windows=True):
         now = time.monotonic()
         procs = sample_processes()
         busy, total = cpu_totals()
@@ -1118,7 +1122,7 @@ class Sampler:
 
         # Group by program, not by process: Chrome is one thing to a person
         # even though it is forty processes to the kernel.
-        wins = windows_by_pid()
+        wins = windows_by_pid() if with_windows else {}
         up = uptime_seconds()
         groups = {}
         zombies = 0
@@ -1212,8 +1216,8 @@ class Sampler:
         }
         return sample, ranked
 
-    def report(self, interval_hint):
-        sample, groups = self.collect(interval_hint)
+    def report(self, interval_hint, with_windows=True):
+        sample, groups = self.collect(interval_hint, with_windows)
         report = Narrator(sample).run(groups, sample)
         report["ts"] = int(time.time())
         return report
@@ -1232,34 +1236,90 @@ def render_text(report):
     return "\n".join(out)
 
 
+def read_command(timeout):
+    """Wait up to `timeout` seconds for a control line on stdin.
+
+    The front-end tells us when its panel opens and closes so we can sample
+    often and gather window counts while someone is reading, and back off to a
+    slow heartbeat when the bar only needs one word. Returns the line, or None
+    if the wait expired. Falls back to a plain sleep when stdin is not a pipe,
+    which is the case for --text and one-shot runs from a terminal.
+    """
+    if timeout > 0:
+        try:
+            ready, _, _ = select.select([sys.stdin], [], [], timeout)
+        except (ValueError, OSError):
+            time.sleep(timeout)
+            return None
+        if not ready:
+            return None
+    line = sys.stdin.readline()
+    if line == "":
+        # stdin closed: the front-end is gone, so there is nobody to report to.
+        raise SystemExit(0)
+    return line.strip()
+
+
 def main():
     args = sys.argv[1:]
     watch = "--watch" in args
     as_text = "--text" in args
 
-    interval = 5.0
-    for i, arg in enumerate(args):
-        if arg == "--interval" and i + 1 < len(args):
-            try:
-                interval = max(1.0, float(args[i + 1]))
-            except ValueError:
-                pass
+    def number_arg(flag, fallback):
+        for i, arg in enumerate(args):
+            if arg == flag and i + 1 < len(args):
+                try:
+                    return max(1.0, float(args[i + 1]))
+                except ValueError:
+                    pass
+        return fallback
+
+    # Two cadences: `interval` while someone is looking at the panel, and
+    # `idle_interval` while it is closed and only the bar word is on screen.
+    interval = number_arg("--interval", 5.0)
+    idle_interval = number_arg("--idle-interval", max(interval, 15.0))
 
     sampler = Sampler()
     # The first sample has no previous one to diff against, so every CPU
     # number would be zero. Prime it, wait, then report for real.
-    sampler.collect(interval)
+    sampler.collect(interval, with_windows=False)
     time.sleep(min(interval, 1.0))
 
+    # Assume closed: the panel announces itself when it opens.
+    panel_open = False
+
     while True:
-        report = sampler.report(interval)
+        # Window counts only ever appear in the popup, so the hyprctl spawn is
+        # skipped entirely while nobody can see them.
+        report = sampler.report(interval if panel_open else idle_interval,
+                                with_windows=panel_open)
         if as_text:
             print(render_text(report), flush=True)
         else:
             print(json.dumps(report), flush=True)
         if not watch:
             return
-        time.sleep(interval)
+
+        wait = interval if panel_open else idle_interval
+        deadline = time.monotonic() + wait
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            command = read_command(remaining)
+            if command is None:
+                break
+            if command == "open" and not panel_open:
+                panel_open = True
+                # Re-read now so the panel opens onto fresh numbers and window
+                # counts -- but never on top of a sample taken moments ago,
+                # which would divide by a tiny interval and print noise.
+                if time.monotonic() - (sampler.prev_time or 0) >= 1.0:
+                    break
+                deadline = min(deadline, (sampler.prev_time or 0) + 1.0)
+            elif command == "closed" and panel_open:
+                panel_open = False
+                deadline = min(deadline, time.monotonic() + idle_interval)
 
 
 if __name__ == "__main__":

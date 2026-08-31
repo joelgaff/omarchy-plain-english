@@ -22,9 +22,26 @@ QtObject {
     return dir.replace(/\/$/, "")
   }
 
-  // Seconds between readings. Widgets write this from their settings; the
-  // helper is restarted when it changes.
+  // Two cadences. `intervalSec` applies while a panel is open and someone is
+  // reading; `idleIntervalSec` applies while every panel is closed and only
+  // the bar word is on screen. Widgets write both from their settings.
   property int intervalSec: 5
+  property int idleIntervalSec: 15
+
+  // A bar widget exists per monitor, so panels are counted rather than
+  // flagged: the helper stays in fast mode until the last one closes.
+  property int openPanels: 0
+  readonly property bool anyPanelOpen: openPanels > 0
+
+  function setPanelOpen(open) {
+    root.openPanels = Math.max(0, root.openPanels + (open ? 1 : -1))
+  }
+
+  // Tell the helper which cadence to use. It also skips the hyprctl window
+  // lookup while closed, since window counts only appear in the popup.
+  onAnyPanelOpenChanged: {
+    if (reporter.running) reporter.write(root.anyPanelOpen ? "open\n" : "closed\n")
+  }
 
   property string activity: "quiet"
   property string barLabel: ""
@@ -87,10 +104,12 @@ QtObject {
     reporter.running = true
   }
 
-  function setInterval(seconds) {
+  function setInterval(seconds, idleSeconds) {
     var value = Math.max(2, Math.round(seconds))
-    if (value === root.intervalSec) return
+    var idle = Math.max(value, Math.round(idleSeconds || root.idleIntervalSec))
+    if (value === root.intervalSec && idle === root.idleIntervalSec) return
     root.intervalSec = value
+    root.idleIntervalSec = idle
     if (reporter.running) restart()
   }
 
@@ -100,12 +119,18 @@ QtObject {
   // history that separates "busy right now" from "stuck for an hour".
   property Process reporter: Process {
     running: true
+    stdinEnabled: true
     command: [
       root.pluginDir + "/bin/plain-english-activity",
       "--watch",
       "--interval",
-      String(root.intervalSec)
+      String(root.intervalSec),
+      "--idle-interval",
+      String(root.idleIntervalSec)
     ]
+
+    // A restart loses the helper's idea of panel state, so re-assert it.
+    onStarted: if (root.anyPanelOpen) write("open\n")
 
     stdout: SplitParser {
       onRead: function(line) {

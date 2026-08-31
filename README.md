@@ -114,7 +114,8 @@ In the plugin's entry under `bar.layout` in `~/.config/omarchy/shell.json`:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `intervalSec` | `5` | Seconds between readings |
+| `intervalSec` | `5` | Seconds between readings while the panel is open |
+| `idleIntervalSec` | `15` | Seconds between readings while it is closed |
 | `showLabel` | `true` | Show the state word beside the icon |
 
 ## Reading it from a terminal
@@ -128,6 +129,9 @@ wrong:
 ./bin/plain-english-activity            # one line of JSON, once
 ./bin/plain-english-activity --watch    # a line of JSON every interval
 ```
+
+In `--watch` mode it also accepts `open` and `closed` on stdin to switch
+between the two cadences, which is how the panel drives it.
 
 ## How it works
 
@@ -151,6 +155,14 @@ beyond Python 3, no root, nothing installed.
   been spinning since before the plugin started watching.
 - **Windows** come from `hyprctl clients`, so a program can be described by how
   many windows you have open, not just how many processes it spawned.
+
+It costs about **0.1% of one core and 10 MB** while you are not looking at it,
+because it works at two speeds. The panel tells the helper when it opens, and
+the helper answers by sampling at `intervalSec` and collecting window counts;
+when the panel closes it drops back to `idleIntervalSec` and stops spawning
+`hyprctl` altogether, since window counts are only ever drawn in the popup.
+That halves its idle cost. For scale, the Quickshell process it plugs into is
+around 590 MB.
 
 The narration is a deterministic rule engine over that data — no model, no
 network, no telemetry. The same numbers always produce the same sentences.

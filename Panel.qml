@@ -68,10 +68,21 @@ Panel {
     if (bar) bar.run("omarchy-launch-or-focus-tui btop")
   }
 
-  // The singleton is shared, so the interval follows whichever bar entry sets
-  // it rather than each instance fighting over the value.
-  onSettingsChanged: ActivityState.setInterval(setting("intervalSec", 5))
-  Component.onCompleted: ActivityState.setInterval(setting("intervalSec", 5))
+  // The singleton is shared, so the intervals follow whichever bar entry sets
+  // them rather than each instance fighting over the value.
+  function applyIntervals() {
+    ActivityState.setInterval(setting("intervalSec", 5), setting("idleIntervalSec", 15))
+  }
+
+  onSettingsChanged: applyIntervals()
+  Component.onCompleted: applyIntervals()
+
+  // Tell the helper to sample often and collect window counts only while
+  // someone is actually reading the report. Counted, not flagged, because a
+  // widget exists per monitor. Component.onDestruction covers a plugin reload
+  // that tears the widget down while its panel is open.
+  onOpenedChanged: ActivityState.setPanelOpen(opened)
+  Component.onDestruction: if (opened) ActivityState.setPanelOpen(false)
 
   // The bar reads the slot's width off the widget root, so a Panel that never
   // sizes itself is allotted zero pixels and renders as nothing at all.
