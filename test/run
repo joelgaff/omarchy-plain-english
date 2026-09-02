@@ -12,6 +12,10 @@ echo "== producer bounds (bin/plain-english-activity) =="
 python3 test/producer_test.py
 
 echo
+echo "== bounded child reads (bin/plain-english-activity) =="
+python3 test/reader_test.py
+
+echo
 echo "== consumer validation (ActivityState.qml) =="
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 python3 - "$tmp" <<'PY'

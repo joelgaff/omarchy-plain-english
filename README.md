@@ -217,10 +217,35 @@ which is `StyledText` so `**name**` can render bold, and its content is HTML
 default to Qt's `AutoText`, so angle brackets are stripped at ingest and never
 reach them.
 
-**`hyprctl` output is bounded.** Read with a byte cap, parsed with a client
-cap, and the child is started in its own process group so a timeout kills the
-whole tree rather than orphaning it. Window titles are counted, never
-retained: a title is arbitrary text from any application.
+**Every read from a child or from `/proc` is bounded.** `hyprctl` is read
+through a non-blocking reader with an absolute deadline, because a plain
+`read(n)` blocks until it has `n` bytes or sees EOF -- so a child that prints
+a little and then hangs would block forever and make any later timeout
+unreachable. Output is capped by bytes and by client count, the child runs in
+its own process group so a timeout signals the whole tree, and window titles
+are counted and discarded rather than retained: a title is arbitrary text from
+any application. Every `/proc` and `/sys` read is capped too, and an
+oversized file is skipped rather than truncated -- a half-read
+`/proc/<pid>/stat` would parse into wrong numbers, which is worse than none.
+One scan examines a bounded number of processes.
+
+**No child outlives the helper.** Quickshell terminates the helper, not its
+descendants, so the helper tracks its own children and reaps them from
+`SIGTERM`, `SIGINT`, `SIGHUP` and `atexit`. `SIGKILL` cannot be trapped, which
+is why the bounded deadlines above matter: they keep the window in which any
+child exists as short as possible.
+
+**A wedged helper is detected and replaced.** Quickshell's stream parsers
+expose no buffer cap -- `SplitParser` has only `splitMarker`, `StdioCollector`
+only `text`/`data`/`waitForEnd`, and `FileView` has no size limit -- so a byte
+cap cannot be enforced inside the parser, before delimiter buffering. The
+shipped helper cannot exploit that: it emits newline-terminated lines under a
+hard 16 KB cap and fails closed. For a helper that is *not* the shipped one --
+replaced mid-update, older, or faulty -- a stall watchdog covers it. Such a
+helper produces no complete lines, so the absence of a report is the
+detectable symptom; after three intervals it is terminated, its descendants
+reaped, and a fresh one started. An oversized line that does arrive terminates
+the helper rather than merely being skipped.
 
 **The helper is supervised.** If it exits unexpectedly the front-end restarts
 it with exponential backoff, giving up after five attempts with a message

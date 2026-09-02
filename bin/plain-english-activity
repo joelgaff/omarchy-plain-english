@@ -13,6 +13,7 @@ The QML front-end renders the JSON; the --text mode is what makes this
 debuggable from a terminal.
 """
 
+import atexit
 import json
 import os
 import re
@@ -39,6 +40,9 @@ MAX_NAME_CHARS = 32       # characters in a displayed program name
 MAX_REPORT_BYTES = 16384  # bytes in the emitted JSON line
 MAX_HYPRCTL_BYTES = 262144  # bytes read from hyprctl before giving up
 MAX_HYPRCTL_CLIENTS = 500   # window entries parsed from hyprctl
+MAX_HYPRCTL_SECONDS = 2.0   # absolute deadline for the whole hyprctl call
+MAX_PROC_FILE_BYTES = 65536  # bytes read from any single /proc or /sys file
+MAX_PROCESSES = 4096        # processes examined in one scan
 
 # ---------------------------------------------------------------------------
 # Who is this process, in words
@@ -275,12 +279,24 @@ def normalize(name):
 # ---------------------------------------------------------------------------
 
 
-def read(path, default=""):
+def read(path, default="", limit=MAX_PROC_FILE_BYTES):
+    """Read a small pseudo-file, refusing anything unexpectedly large.
+
+    Nothing under /proc or /sys that this program reads is legitimately big --
+    the largest is /proc/<pid>/cmdline, which the kernel caps well below the
+    limit here. Reading limit+1 bytes distinguishes "at the limit" from
+    "larger than the limit", and an oversized file is skipped rather than
+    truncated: a half-read /proc/<pid>/stat would parse into wrong numbers,
+    which is worse than no numbers.
+    """
     try:
         with open(path, "rb") as handle:
-            return handle.read().decode("utf-8", "replace")
+            blob = handle.read(limit + 1)
     except OSError:
         return default
+    if len(blob) > limit:
+        return default
+    return blob.decode("utf-8", "replace")
 
 
 def read_int(path, default=None):
@@ -339,9 +355,16 @@ def sample_processes():
     machine is both wrong and useless.
     """
     procs = {}
+    scanned = 0
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
             continue
+        # Bound the aggregate work of one scan. A machine with more processes
+        # than this has bigger problems, and an unbounded scan would let fork
+        # pressure turn a monitor into a second source of load.
+        if scanned >= MAX_PROCESSES:
+            break
+        scanned += 1
         pid = int(entry)
         if pid == SELF_PID:
             continue
@@ -559,7 +582,7 @@ def windows_by_pid():
     proc = None
     try:
         # start_new_session so the child leads its own process group: on
-        # timeout we can signal the whole tree instead of orphaning anything
+        # timeout we signal the whole tree instead of orphaning whatever
         # hyprctl spawned.
         proc = subprocess.Popen(
             ["hyprctl", "-j", "clients"],
@@ -567,12 +590,10 @@ def windows_by_pid():
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
-        # read() with a cap, so a runaway or hostile writer cannot make us
-        # buffer without limit.
-        raw = proc.stdout.read(MAX_HYPRCTL_BYTES + 1)
-        if len(raw) > MAX_HYPRCTL_BYTES:
+        register_child(proc)
+        raw = read_bounded(proc.stdout, MAX_HYPRCTL_BYTES, MAX_HYPRCTL_SECONDS)
+        if raw is None:
             return {}
-        proc.wait(timeout=2)
         clients = json.loads(raw.decode("utf-8", "replace"))
     except (OSError, ValueError, subprocess.SubprocessError):
         return {}
@@ -592,6 +613,56 @@ def windows_by_pid():
         if isinstance(pid, int) and 0 < pid < 2 ** 31:
             out[pid] = out.get(pid, 0) + 1
     return out
+
+
+def read_bounded(stream, limit, seconds):
+    """Read at most `limit` bytes within `seconds`, never blocking past it.
+
+    A plain read(n) blocks until it has n bytes or sees EOF, so a child that
+    prints a little and then hangs would block forever and make a later
+    wait(timeout=...) meaningless -- the timeout is never reached because the
+    read never returns. Polling a non-blocking pipe against an absolute
+    deadline is what actually bounds the call.
+
+    Returns the bytes read, or None if the deadline passed or the cap was
+    exceeded. None means "do not trust this output", not "empty output".
+    """
+    deadline = time.monotonic() + seconds
+    fd = stream.fileno()
+    os.set_blocking(fd, False)
+    chunks = []
+    total = 0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        try:
+            ready, _, _ = select.select([fd], [], [], remaining)
+        except (OSError, ValueError):
+            return None
+        if not ready:
+            return None
+        try:
+            chunk = os.read(fd, 65536)
+        except BlockingIOError:
+            continue
+        except OSError:
+            return None
+        if not chunk:
+            return b"".join(chunks)  # EOF: the child closed stdout
+        total += len(chunk)
+        if total > limit:
+            return None
+        chunks.append(chunk)
+
+
+# Every child this process starts, so none outlives it. Quickshell terminates
+# the helper, not the helper's descendants, so cleanup is our responsibility.
+LIVE_CHILDREN = set()
+
+
+def register_child(proc):
+    LIVE_CHILDREN.add(proc)
 
 
 def terminate_group(proc):
@@ -616,6 +687,7 @@ def terminate_group(proc):
         proc.wait(timeout=1)
     except subprocess.TimeoutExpired:
         pass
+    LIVE_CHILDREN.discard(proc)
 
 
 def uptime_seconds():
@@ -1382,7 +1454,31 @@ def read_command(timeout):
     return line.strip()
 
 
+def reap_children(*_args):
+    """Terminate and reap every child before we exit, for any reason.
+
+    Quickshell's Process controls the helper, not the helper's descendants, so
+    a plain kill of this process would leave an in-flight hyprctl running.
+    Installed for SIGTERM and SIGINT and registered with atexit, so a normal
+    exit, a shell restart, and a supervised kill all clean up the same way.
+    SIGKILL cannot be caught -- hence the deadline-bounded reads above, which
+    keep the window in which a child exists as short as possible.
+    """
+    for proc in list(LIVE_CHILDREN):
+        terminate_group(proc)
+
+
+def install_cleanup():
+    atexit.register(reap_children)
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        try:
+            signal.signal(sig, lambda s, f: sys.exit(0))
+        except (OSError, ValueError):
+            pass
+
+
 def main():
+    install_cleanup()
     args = sys.argv[1:]
     watch = "--watch" in args
     as_text = "--text" in args

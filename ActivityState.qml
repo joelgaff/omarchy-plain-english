@@ -68,6 +68,32 @@ QtObject {
   property bool stopping: false
   property string stderrTail: ""
 
+  // Quickshell's DataStreamParser types expose no buffer cap: SplitParser has
+  // only splitMarker, StdioCollector only text/data/waitForEnd, and FileView
+  // has no size limit either. So a byte cap cannot be enforced inside the
+  // parser, before delimiter buffering -- a helper that wrote endlessly with
+  // no newline would grow the parser's buffer with nothing in QML to stop it.
+  //
+  // The shipped helper cannot do that: it emits newline-terminated lines
+  // under a hard 16KB cap and fails closed. This watchdog covers the case
+  // where the helper is not the shipped one -- replaced mid-update, older, or
+  // faulty. A helper buffering an unterminated line produces no complete
+  // lines, so the absence of a report is the detectable symptom, and killing
+  // it bounds the time any such buffer can grow.
+  function killHelper(reason) {
+    root.error = reason
+    if (!reporter.running) return
+    // SIGTERM rather than SIGKILL: the helper traps it and reaps its own
+    // descendants. forceKill closes the window if it does not go quietly.
+    reporter.signal(15)
+    forceKill.restart()
+  }
+
+  function noteProgress() {
+    stallWatchdog.interval = Math.max(30000, root.intervalSec * 3000)
+    stallWatchdog.restart()
+  }
+
   function setPanelOpen(open) {
     root.openPanels = Math.max(0, root.openPanels + (open ? 1 : -1))
   }
@@ -159,7 +185,9 @@ QtObject {
     // which draws the bar, notifications, and OSD for the whole session.
     if (typeof json !== "string" || json.length === 0) return
     if (json.length > root.maxLineBytes) {
-      root.error = "The activity helper sent an oversized report."
+      // Terminating rather than skipping: a helper emitting oversized lines
+      // will keep doing it, and each one costs a full parse.
+      killHelper("The activity helper sent an oversized report and was stopped.")
       return
     }
 
@@ -186,6 +214,7 @@ QtObject {
     root.error = ""
     root.everRead = true
     root.restarts = 0
+    noteProgress()
   }
 
   function restart() {
@@ -221,7 +250,10 @@ QtObject {
     ]
 
     // A restart loses the helper's idea of panel state, so re-assert it.
-    onStarted: if (root.anyPanelOpen) write("open\n")
+    onStarted: {
+      if (root.anyPanelOpen) write("open\n")
+      root.noteProgress()
+    }
 
     stdout: SplitParser {
       onRead: function(line) { root.apply(line) }
@@ -260,5 +292,22 @@ QtObject {
   property Timer supervisor: Timer {
     repeat: false
     onTriggered: if (!reporter.running) reporter.running = true
+  }
+
+  // No valid report within three intervals means the helper is wedged, silent,
+  // or buffering something it will never terminate. Any of those warrant the
+  // same response.
+  property Timer stallWatchdog: Timer {
+    repeat: false
+    onTriggered: root.killHelper("The activity helper stopped reporting and was restarted.")
+  }
+
+  // Escalation if SIGTERM is ignored. Dropping running to false makes
+  // Quickshell tear the process down, which fires onExited and the usual
+  // supervised restart.
+  property Timer forceKill: Timer {
+    interval: 3000
+    repeat: false
+    onTriggered: if (reporter.running) reporter.running = false
   }
 }
