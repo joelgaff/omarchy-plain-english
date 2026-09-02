@@ -187,6 +187,50 @@ The third field decides the tone of the "should I worry" sentence: `app`,
 burning a core is called stuck; a `dev` process burning a core is called a
 build.
 
+## Robustness and untrusted input
+
+The helper reports on processes, and a process names itself, so its output is
+attacker-influenced by construction. Both sides of the pipe are bounded, and
+the redundancy is deliberate: a replaced, patched, or older helper cannot lift
+a cap the front-end enforces.
+
+**The helper bounds what it emits.** At most 24 narration lines, 400
+characters each, 8 concerns, 32-character program names, and a hard 16 KB
+ceiling on the JSON line. Oversized reports drop lines until they fit and are
+flagged `truncated`; if even the skeleton is too large, a minimal valid report
+is sent instead of a truncated, unparseable one. Control characters and
+newlines are stripped from every string, so a program that names itself with
+a terminal escape cannot corrupt the stream or the `--text` output.
+
+**The front-end validates everything it receives.** Lines over 64 KB are
+rejected before `JSON.parse` runs, because parsing megabytes would block the
+Quickshell thread that draws the bar, notifications, and OSD for the whole
+session. Every field is then type-checked and bounded: strings clamped and
+stripped of control characters and angle brackets, numbers coerced and
+range-limited, tones and states checked against allow-lists, arrays capped by
+count, and non-object or top-level-array payloads rejected outright.
+
+**Nothing untrusted reaches a rich-text sink.** Every `Text` the plugin owns
+sets `textFormat: Text.PlainText`. The single exception is the narration line,
+which is `StyledText` so `**name**` can render bold, and its content is HTML
+-escaped first. Shared components such as `PanelHero` and `PanelSectionHeader`
+default to Qt's `AutoText`, so angle brackets are stripped at ingest and never
+reach them.
+
+**`hyprctl` output is bounded.** Read with a byte cap, parsed with a client
+cap, and the child is started in its own process group so a timeout kills the
+whole tree rather than orphaning it. Window titles are counted, never
+retained: a title is arbitrary text from any application.
+
+**The helper is supervised.** If it exits unexpectedly the front-end restarts
+it with exponential backoff, giving up after five attempts with a message
+saying how to reproduce the failure in a terminal, rather than leaving the bar
+frozen on a stale reading.
+
+Run `./test/run` to exercise all of this. The validator tests extract their
+functions verbatim from `ActivityState.qml`, so they cannot drift from the
+code they cover.
+
 ## What it accesses, and what it does not
 
 It reads, all locally:

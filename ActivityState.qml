@@ -10,8 +10,24 @@ import Quickshell.Io
 // two sets of numbers that disagree. Everything stateful lives here instead:
 // one helper however many bars are on the desk, and every popup showing the
 // same reading at the same moment.
+//
+// Nothing arriving from the helper is trusted. It reports on processes, and a
+// process names itself, so its output is attacker-influenced by construction.
+// The helper bounds what it emits; this file bounds what it accepts, and the
+// redundancy is deliberate -- an older or replaced helper cannot lift a cap.
 QtObject {
   id: root
+
+  // Ingest limits, mirroring the caps in bin/plain-english-activity.
+  readonly property int maxLineBytes: 65536
+  readonly property int maxLines: 24
+  readonly property int maxTextChars: 400
+  readonly property int maxConcerns: 8
+  readonly property int maxSections: 8
+  readonly property int maxStderrChars: 2000
+
+  readonly property var validTones: ["normal", "good", "warn", "bad", "dim"]
+  readonly property var validStates: ["quiet", "busy", "working", "strained"]
 
   // Derived from this file's own location rather than a hardcoded install
   // path: the plugin still works when it is cloned under a different
@@ -33,6 +49,25 @@ QtObject {
   property int openPanels: 0
   readonly property bool anyPanelOpen: openPanels > 0
 
+  property string activity: "quiet"
+  property string barLabel: ""
+  property string headline: ""
+  property string summary: ""
+  property var lines: []
+  property var concerns: []
+  property real cpuPercent: 0
+  property real memPercent: 0
+  property string uptime: ""
+  property int cores: 0
+  property bool truncated: false
+  property string error: ""
+  property bool everRead: false
+
+  // Supervision state.
+  property int restarts: 0
+  property bool stopping: false
+  property string stderrTail: ""
+
   function setPanelOpen(open) {
     root.openPanels = Math.max(0, root.openPanels + (open ? 1 : -1))
   }
@@ -43,29 +78,73 @@ QtObject {
     if (reporter.running) reporter.write(root.anyPanelOpen ? "open\n" : "closed\n")
   }
 
-  property string activity: "quiet"
-  property string barLabel: ""
-  property string headline: ""
-  property string summary: ""
-  property var lines: []
-  property var concerns: []
-  property real cpuPercent: 0
-  property real memPercent: 0
-  property string uptime: ""
-  property var power: ({})
-  property var thermals: ({})
-  property int cores: 0
-  property string error: ""
-  property bool everRead: false
+  // ---- validation ---------------------------------------------------------
+  //
+  // Every field is coerced to its expected type with an explicit bound. A
+  // missing, mistyped, or oversized value becomes a safe default rather than
+  // reaching a property binding.
+
+  function safeString(value, limit) {
+    if (typeof value !== "string") return ""
+    // Strip C0/C1 controls and Unicode line separators: they cannot render
+    // usefully, and would let a program name break the panel's layout.
+    // Also strip angle brackets. Several sinks are shared Ui components
+    // (PanelHero, PanelSectionHeader) whose Text defaults to AutoText, which
+    // renders anything that looks like markup. We cannot set PlainText on
+    // those from here, so no raw "<" is allowed through in the first place.
+    // Our own narration never uses angle brackets, so nothing legitimate is
+    // lost. richText() still escapes on the way out, deliberately twice.
+    var cleaned = value.replace(/[\x00-\x1F\x7F-\x9F\u2028\u2029<>]/g, "")
+    return cleaned.length > limit ? cleaned.substring(0, limit) : cleaned
+  }
+
+  function safeNumber(value, low, high) {
+    var n = Number(value)
+    if (!isFinite(n)) return low
+    return Math.min(high, Math.max(low, n))
+  }
+
+  function safeEnum(value, allowed, fallback) {
+    return allowed.indexOf(value) >= 0 ? value : fallback
+  }
+
+  function safeStringList(value, maxItems, limit) {
+    if (!Array.isArray(value)) return []
+    var out = []
+    for (var i = 0; i < value.length && out.length < maxItems; i++) {
+      var s = safeString(value[i], limit)
+      if (s !== "") out.push(s)
+    }
+    return out
+  }
+
+  function safeLines(value) {
+    if (!Array.isArray(value)) return []
+    var out = []
+    for (var i = 0; i < value.length && out.length < root.maxLines; i++) {
+      var item = value[i]
+      if (!item || typeof item !== "object" || Array.isArray(item)) continue
+      var text = safeString(item.text, root.maxTextChars)
+      if (text === "") continue
+      out.push({
+        "section": safeString(item.section, 40),
+        "text": text,
+        "tone": safeEnum(item.tone, root.validTones, "normal")
+      })
+    }
+    return out
+  }
 
   // Sections come back interleaved with their lines; group them once here so
-  // every popup does not regroup the same list.
+  // every popup does not regroup the same list. Bounded so a report with many
+  // distinct section names cannot create unbounded delegates.
   readonly property var sections: {
     var out = []
     var current = null
     for (var i = 0; i < lines.length; i++) {
       var line = lines[i]
       if (!current || current.title !== line.section) {
+        if (out.length >= root.maxSections) break
         current = { "title": line.section, "items": [] }
         out.push(current)
       }
@@ -75,38 +154,50 @@ QtObject {
   }
 
   function apply(json) {
+    // Bound before parsing: a huge line must never become a huge JS object
+    // graph, and JSON.parse on megabytes would block the shell's UI thread --
+    // which draws the bar, notifications, and OSD for the whole session.
+    if (typeof json !== "string" || json.length === 0) return
+    if (json.length > root.maxLineBytes) {
+      root.error = "The activity helper sent an oversized report."
+      return
+    }
+
     var report
     try {
       report = JSON.parse(json)
     } catch (e) {
       return
     }
-    if (!report || typeof report !== "object") return
+    // Arrays are objects in JS, so a top-level array would pass a naive check.
+    if (!report || typeof report !== "object" || Array.isArray(report)) return
 
-    root.activity = report.state || "quiet"
-    root.barLabel = report.barLabel || ""
-    root.headline = report.headline || ""
-    root.summary = report.summary || ""
-    root.lines = report.lines || []
-    root.concerns = report.concerns || []
-    root.cpuPercent = report.cpuPercent || 0
-    root.memPercent = report.memPercent || 0
-    root.uptime = report.uptime || ""
-    root.power = report.power || ({})
-    root.thermals = report.thermals || ({})
-    root.cores = report.cores || 0
+    root.activity = safeEnum(report.state, root.validStates, "quiet")
+    root.barLabel = safeString(report.barLabel, 24)
+    root.headline = safeString(report.headline, root.maxTextChars)
+    root.summary = safeString(report.summary, root.maxTextChars)
+    root.lines = safeLines(report.lines)
+    root.concerns = safeStringList(report.concerns, root.maxConcerns, root.maxTextChars)
+    root.cpuPercent = safeNumber(report.cpuPercent, 0, 100)
+    root.memPercent = safeNumber(report.memPercent, 0, 100)
+    root.uptime = safeString(report.uptime, 32)
+    root.cores = Math.round(safeNumber(report.cores, 0, 4096))
+    root.truncated = report.truncated === true
     root.error = ""
     root.everRead = true
+    root.restarts = 0
   }
 
   function restart() {
+    root.stopping = true
     reporter.running = false
     reporter.running = true
+    root.stopping = false
   }
 
   function setInterval(seconds, idleSeconds) {
-    var value = Math.max(2, Math.round(seconds))
-    var idle = Math.max(value, Math.round(idleSeconds || root.idleIntervalSec))
+    var value = Math.round(safeNumber(seconds, 2, 300))
+    var idle = Math.max(value, Math.round(safeNumber(idleSeconds, 2, 3600)))
     if (value === root.intervalSec && idle === root.idleIntervalSec) return
     root.intervalSec = value
     root.idleIntervalSec = idle
@@ -133,21 +224,41 @@ QtObject {
     onStarted: if (root.anyPanelOpen) write("open\n")
 
     stdout: SplitParser {
-      onRead: function(line) {
-        if (line && line.length > 0) root.apply(line)
-      }
+      onRead: function(line) { root.apply(line) }
     }
 
-    stderr: StdioCollector {
-      onStreamFinished: {
-        var text = String(this.text || "").trim()
-        if (text !== "" && !root.everRead) root.error = text.split("\n").pop()
+    // SplitParser rather than StdioCollector: a collector accumulates the
+    // whole stream for the life of the process, which for a daemon running
+    // for days is unbounded. Only a short tail is ever useful.
+    stderr: SplitParser {
+      onRead: function(line) {
+        var text = root.safeString(line, 200)
+        if (text === "") return
+        var tail = root.stderrTail + text + "\n"
+        if (tail.length > root.maxStderrChars)
+          tail = tail.substring(tail.length - root.maxStderrChars)
+        root.stderrTail = tail
       }
     }
 
     onExited: function(exitCode) {
-      if (exitCode !== 0 && !root.everRead && root.error === "")
-        root.error = "The activity helper stopped (exit " + exitCode + ")."
+      if (root.stopping) return
+      // Supervision: a helper that dies leaves the bar frozen on a stale
+      // reading with nothing to say it has stopped. Restart it, backing off
+      // so a helper that crashes at startup cannot become a spawn loop.
+      root.restarts += 1
+      if (root.restarts <= 5) {
+        supervisor.interval = Math.min(60000, 1000 * Math.pow(2, root.restarts - 1))
+        supervisor.restart()
+        return
+      }
+      root.error = "The activity helper keeps stopping (exit " + exitCode
+        + "). Run bin/plain-english-activity --text in a terminal to see why."
     }
+  }
+
+  property Timer supervisor: Timer {
+    repeat: false
+    onTriggered: if (!reporter.running) reporter.running = true
   }
 }

@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "joelgaff.plain-english",
   "name": "Plain English",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": "Joel Gaff, Jr.",
   "license": "MIT",
   "description": "Your system statistics as sentences: what each program is doing, whether it is normal, and what is actually worth acting on.",

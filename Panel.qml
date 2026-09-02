@@ -155,6 +155,7 @@ Panel {
             iconComponent: Component {
               Text {
                 text: root.stateIcon
+                textFormat: Text.PlainText
                 color: root.flagged ? root.urgent : root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.display
@@ -166,6 +167,7 @@ Panel {
             visible: ActivityState.summary !== ""
             width: parent.width
             text: ActivityState.summary
+            textFormat: Text.PlainText
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
@@ -176,6 +178,7 @@ Panel {
             visible: root.broken
             width: parent.width
             text: ActivityState.error
+            textFormat: Text.PlainText
             color: root.urgent
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
@@ -187,6 +190,7 @@ Panel {
             width: parent.width
             text: "Taking a first reading. CPU use has to be measured over time, "
                 + "so this takes a moment."
+            textFormat: Text.PlainText
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
@@ -225,6 +229,7 @@ Panel {
                   Text {
                     id: bullet
                     text: "•"
+                    textFormat: Text.PlainText
                     color: root.toneColor(lineRow.modelData.tone)
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.body
@@ -250,6 +255,7 @@ Panel {
           Text {
             width: parent.width
             text: "r refresh · b open btop · Esc close"
+            textFormat: Text.PlainText
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption

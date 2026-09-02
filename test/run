@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Validator tests for ActivityState.qml.
+#
+# The functions under test are extracted verbatim from the shipped QML rather
+# than copied, so the tests cannot drift from the code they cover. Needs node
+# for the JS half and python3 for the extraction; both are already required to
+# work on this repo.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+echo "== producer bounds (bin/plain-english-activity) =="
+python3 test/producer_test.py
+
+echo
+echo "== consumer validation (ActivityState.qml) =="
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+python3 - "$tmp" <<'PY'
+import re, sys
+tmp = sys.argv[1]
+src = open("ActivityState.qml", encoding="utf-8").read()
+names = ["safeString", "safeNumber", "safeEnum", "safeStringList", "safeLines"]
+out = ["const root = { maxLines:24, maxTextChars:400, maxConcerns:8, maxSections:8,",
+       "  validTones:['normal','good','warn','bad','dim'],",
+       "  validStates:['quiet','busy','working','strained'] };"]
+for n in names:
+    m = re.search(r"\n  function %s\(.*?\n  \}" % n, src, re.S)
+    if not m:
+        raise SystemExit("could not extract %s from ActivityState.qml" % n)
+    out.append(m.group(0))
+out += ["root.%s = %s;" % (n, n) for n in names]
+a = open("test/assertions.js", encoding="utf-8").read()
+a = a.replace('"a b[31mc d"', '"a\\u0000b\\u001b[31mc\\u2028d"')
+open(tmp + "/harness.js", "w", encoding="utf-8").write("\n".join(out) + "\n" + a)
+PY
+node "$tmp/harness.js"

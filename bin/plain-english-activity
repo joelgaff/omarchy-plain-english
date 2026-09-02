@@ -17,6 +17,7 @@ import json
 import os
 import re
 import select
+import signal
 import subprocess
 import sys
 import time
@@ -24,6 +25,20 @@ import time
 HZ = os.sysconf("SC_CLK_TCK")
 PAGE = os.sysconf("SC_PAGE_SIZE")
 NCPU = os.cpu_count() or 1
+
+# Hard bounds on everything this program emits or ingests.
+#
+# The front-end is a long-running Quickshell process that parses our stdout on
+# every tick, so an unbounded report is its problem, not ours. Every limit is
+# enforced here, at the producer, and again at the consumer -- neither side
+# trusts the other to have done it.
+MAX_LINES = 24            # narration lines in one report
+MAX_TEXT_CHARS = 400      # characters in one narration line
+MAX_CONCERNS = 8          # entries in the concerns list
+MAX_NAME_CHARS = 32       # characters in a displayed program name
+MAX_REPORT_BYTES = 16384  # bytes in the emitted JSON line
+MAX_HYPRCTL_BYTES = 262144  # bytes read from hyprctl before giving up
+MAX_HYPRCTL_CLIENTS = 500   # window entries parsed from hyprctl
 
 # ---------------------------------------------------------------------------
 # Who is this process, in words
@@ -211,6 +226,20 @@ KERNEL_THREADS = {
 SUFFIXES = ("-wrapped", "-bin", "-real", ".bin", ".real", ".AppImage")
 
 
+def clamp(text, limit):
+    """Trim a string to `limit` characters and strip anything unprintable.
+
+    Program names come from /proc and are attacker-controlled: any process can
+    set its own comm. Control characters would corrupt the JSON line and could
+    smuggle terminal escapes into --text output, so they are dropped here,
+    once, for every string that reaches a report.
+    """
+    text = "".join(c for c in str(text) if c.isprintable())
+    if len(text) > limit:
+        text = text[: max(0, limit - 1)] + "\u2026"
+    return text
+
+
 def friendly(name):
     """Return (display, description, kind) for a raw process name."""
     for prefix, (disp, desc) in KERNEL_THREADS.items():
@@ -219,8 +248,9 @@ def friendly(name):
     if name in PROCESSES:
         return PROCESSES[name]
     # Unknown: show the raw name but say plainly that we don't recognise it,
-    # rather than inventing a description for it.
-    return name, "", "unknown"
+    # rather than inventing a description for it. Clamped because this is the
+    # one display string that comes straight from the process itself.
+    return clamp(name, MAX_NAME_CHARS), "", "unknown"
 
 
 # A bare program name: no whitespace, no flags, nothing argument-shaped, and
@@ -518,7 +548,7 @@ def gpu_busy():
 
 
 def windows_by_pid():
-    """{pid: [window title, ...]} from Hyprland, so we can name what you see.
+    """{pid: window count} from Hyprland, so we can say how many you have open.
 
     Costs a subprocess spawn, and window counts only ever appear in the popup,
     so the caller skips this entirely while the panel is closed.
@@ -526,22 +556,66 @@ def windows_by_pid():
     Best-effort: a missing or failing hyprctl just means we describe processes
     without mentioning windows.
     """
+    proc = None
     try:
-        raw = subprocess.run(
+        # start_new_session so the child leads its own process group: on
+        # timeout we can signal the whole tree instead of orphaning anything
+        # hyprctl spawned.
+        proc = subprocess.Popen(
             ["hyprctl", "-j", "clients"],
-            capture_output=True,
-            timeout=2,
-            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
         )
-        clients = json.loads(raw.stdout)
+        # read() with a cap, so a runaway or hostile writer cannot make us
+        # buffer without limit.
+        raw = proc.stdout.read(MAX_HYPRCTL_BYTES + 1)
+        if len(raw) > MAX_HYPRCTL_BYTES:
+            return {}
+        proc.wait(timeout=2)
+        clients = json.loads(raw.decode("utf-8", "replace"))
     except (OSError, ValueError, subprocess.SubprocessError):
         return {}
+    finally:
+        if proc is not None:
+            terminate_group(proc)
+
+    if not isinstance(clients, list):
+        return {}
     out = {}
-    for client in clients:
+    # Count windows only. Titles are never rendered, so they are not kept:
+    # a window title is attacker-controlled text from any application.
+    for client in clients[:MAX_HYPRCTL_CLIENTS]:
+        if not isinstance(client, dict):
+            continue
         pid = client.get("pid")
-        if isinstance(pid, int) and pid > 0:
-            out.setdefault(pid, []).append(client.get("title") or client.get("class") or "")
+        if isinstance(pid, int) and 0 < pid < 2 ** 31:
+            out[pid] = out.get(pid, 0) + 1
     return out
+
+
+def terminate_group(proc):
+    """Close pipes and make sure the child's whole process group is gone."""
+    try:
+        if proc.stdout:
+            proc.stdout.close()
+    except OSError:
+        pass
+    if proc.poll() is None:
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(os.getpgid(proc.pid), sig)
+            except (OSError, ProcessLookupError):
+                break
+            try:
+                proc.wait(timeout=1)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+    try:
+        proc.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def uptime_seconds():
@@ -554,6 +628,9 @@ def uptime_seconds():
 # ---------------------------------------------------------------------------
 # Saying it in English
 # ---------------------------------------------------------------------------
+
+
+TONES = ("normal", "good", "warn", "bad", "dim")
 
 
 def humanize_bytes(value):
@@ -1059,6 +1136,18 @@ class Narrator:
                 tone="good",
             )
 
+    def bounded_lines(self):
+        """Every narration line, clamped in length and count."""
+        out = []
+        for line in self.lines[:MAX_LINES]:
+            out.append({
+                "section": clamp(line["section"], 40),
+                "text": clamp(line["text"], MAX_TEXT_CHARS),
+                "tone": line["tone"] if line["tone"] in TONES else "normal",
+                "title": clamp(line.get("title", ""), 80),
+            })
+        return out
+
     def run(self, groups, sample):
         state = self.state()
         self.narrate_processes(groups)
@@ -1074,10 +1163,10 @@ class Narrator:
         return {
             "state": state,
             "barLabel": bar,
-            "headline": self.headline(state, bool(self.concerns)),
-            "summary": self.summary(state),
-            "lines": self.lines,
-            "concerns": self.concerns,
+            "headline": clamp(self.headline(state, bool(self.concerns)), MAX_TEXT_CHARS),
+            "summary": clamp(self.summary(state), MAX_TEXT_CHARS),
+            "lines": self.bounded_lines(),
+            "concerns": [clamp(c, MAX_TEXT_CHARS) for c in self.concerns[:MAX_CONCERNS]],
             "cpuPercent": round(self.s["cpuPercent"], 1),
             "memPercent": round(
                 100 * self.s["memory"]["used"] / self.s["memory"]["total"], 1
@@ -1166,7 +1255,7 @@ class Sampler:
             group["cores"] += cores
             group["mem"] += proc["rss"]
             group["pids"] += 1
-            group["windows"] += len(wins.get(pid, []))
+            group["windows"] += wins.get(pid, 0)
             group["lifetime"] += lifetime
             group["age"] = max(group["age"], age)
 
@@ -1221,6 +1310,39 @@ class Sampler:
         report = Narrator(sample).run(groups, sample)
         report["ts"] = int(time.time())
         return report
+
+
+def encode_report(report):
+    """Serialise a report to one line of JSON, never exceeding the byte cap.
+
+    The consumer reads newline-delimited JSON, so the two invariants that
+    matter are: no embedded newline, and a bounded length. ensure_ascii
+    guarantees the first. For the second, narration lines are dropped from the
+    end until it fits, and if even the skeleton is too large we emit a minimal
+    valid report rather than a truncated -- and therefore unparseable -- one.
+    """
+    trimmed = dict(report)
+    lines = list(trimmed.get("lines") or [])
+    while True:
+        blob = json.dumps(trimmed, ensure_ascii=True, separators=(",", ":"))
+        if len(blob) <= MAX_REPORT_BYTES:
+            return blob
+        if not lines:
+            break
+        lines.pop()
+        trimmed["lines"] = lines
+        trimmed["truncated"] = True
+
+    return json.dumps({
+        "state": trimmed.get("state", "quiet"),
+        "barLabel": trimmed.get("barLabel", ""),
+        "headline": "The report was too large to send.",
+        "summary": "",
+        "lines": [],
+        "concerns": [],
+        "truncated": True,
+        "ts": trimmed.get("ts", 0),
+    }, ensure_ascii=True, separators=(",", ":"))
 
 
 def render_text(report):
@@ -1296,7 +1418,7 @@ def main():
         if as_text:
             print(render_text(report), flush=True)
         else:
-            print(json.dumps(report), flush=True)
+            print(encode_report(report), flush=True)
         if not watch:
             return
 
