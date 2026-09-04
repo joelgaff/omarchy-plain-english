@@ -106,6 +106,7 @@ PROCESSES = {
     "zoom": ("Zoom", "a video call", "media"),
     # Media
     "spotify": ("Spotify", "your music player", "media"),
+    "cliamp": ("cliamp", "your music player", "media"),
     "mpv": ("mpv", "a video player", "media"),
     "vlc": ("VLC", "a video player", "media"),
     "obs": ("OBS", "screen recording or streaming", "media"),
