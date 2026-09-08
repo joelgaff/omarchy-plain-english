@@ -16,6 +16,10 @@ echo "== bounded child reads (bin/plain-english-activity) =="
 python3 test/reader_test.py
 
 echo
+echo "== supervisor framing and process group (bin/plain-english-activity) =="
+python3 test/supervisor_test.py
+
+echo
 echo "== consumer validation (ActivityState.qml) =="
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 python3 - "$tmp" <<'PY'

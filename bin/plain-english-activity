@@ -9,6 +9,10 @@ in the words a person would use, not the ones btop uses.
   plain-english-activity --watch    a JSON line every INTERVAL seconds, forever
   plain-english-activity --text     the same report as readable text
 
+--watch runs as two processes: a worker that samples and reports, and a small
+supervisor in front of it that frames the worker's output for the front-end
+and owns the worker's process group. See supervise() for why.
+
 The QML front-end renders the JSON; the --text mode is what makes this
 debuggable from a terminal.
 """
@@ -43,6 +47,9 @@ MAX_HYPRCTL_CLIENTS = 500   # window entries parsed from hyprctl
 MAX_HYPRCTL_SECONDS = 2.0   # absolute deadline for the whole hyprctl call
 MAX_PROC_FILE_BYTES = 65536  # bytes read from any single /proc or /sys file
 MAX_PROCESSES = 4096        # processes examined in one scan
+MAX_FRAME_BYTES = MAX_REPORT_BYTES  # bytes the supervisor buffers per stdout line
+MAX_STDERR_LINE_BYTES = 512  # bytes the supervisor buffers per stderr line
+WORKER_GRACE_SECONDS = 1.0   # SIGTERM-to-SIGKILL for a worker that will not stop
 
 # ---------------------------------------------------------------------------
 # Who is this process, in words
@@ -668,11 +675,12 @@ def register_child(proc):
 
 def terminate_group(proc):
     """Close pipes and make sure the child's whole process group is gone."""
-    try:
-        if proc.stdout:
-            proc.stdout.close()
-    except OSError:
-        pass
+    for stream in (proc.stdin, proc.stdout, proc.stderr):
+        try:
+            if stream:
+                stream.close()
+        except OSError:
+            pass
     if proc.poll() is None:
         for sig in (signal.SIGTERM, signal.SIGKILL):
             try:
@@ -680,7 +688,7 @@ def terminate_group(proc):
             except (OSError, ProcessLookupError):
                 break
             try:
-                proc.wait(timeout=1)
+                proc.wait(timeout=WORKER_GRACE_SECONDS)
                 break
             except subprocess.TimeoutExpired:
                 continue
@@ -1478,11 +1486,228 @@ def install_cleanup():
             pass
 
 
+# ---------------------------------------------------------------------------
+# Supervisor: a byte bound and a process-group boundary in front of the worker
+# ---------------------------------------------------------------------------
+#
+# Quickshell's stream parsers expose no buffer cap and its Process type cannot
+# signal a process group, so neither bound can live in QML. This layer puts
+# both in front of it. The process QML launches is this supervisor; the
+# worker that actually samples runs as a child in its own session, and QML
+# only ever sees what the supervisor chooses to forward:
+#
+#   * stdout is framed into newline-terminated lines of at most
+#     MAX_FRAME_BYTES. A line that grows past that without a newline, or a
+#     complete line over the cap, is fatal: the worker's whole group is
+#     killed and the supervisor exits non-zero, so the front-end's backoff
+#     restart applies. Memory is bounded in bytes, not merely in time.
+#   * stderr is framed the same way at MAX_STDERR_LINE_BYTES, but overflow
+#     there just drops the offending line: noise on stderr is not a reason to
+#     lose the report stream.
+#   * control lines from the front-end are relayed to the worker's stdin.
+#   * on SIGTERM, SIGINT, SIGHUP, stdin EOF, or exit for any other reason,
+#     the worker's group gets SIGTERM, then SIGKILL, and is reaped. The
+#     worker also asks the kernel for SIGTERM if the supervisor dies without
+#     warning (PR_SET_PDEATHSIG), which covers the one signal this layer
+#     cannot trap.
+#
+# The supervisor never parses a report. Validation stays where it was: the
+# worker bounds what it emits and the front-end checks every field again.
+
+
+class LineFramer:
+    """Split a byte stream into newline-terminated lines under a byte cap.
+
+    feed() returns the complete lines seen so far (without their newline).
+    If the pending, unterminated data exceeds `limit`, or a complete line
+    does, `overflowed` is set. In "drop" mode the offending line is discarded
+    and framing resumes at the next newline; in "fatal" mode nothing more is
+    accepted -- the caller is expected to stop the producer.
+    """
+
+    def __init__(self, limit, policy="fatal"):
+        self.limit = limit
+        self.policy = policy
+        self.pending = b""
+        self.discarding = False
+        self.overflowed = False
+        self.dropped = 0
+
+    def feed(self, chunk):
+        if self.overflowed and self.policy == "fatal":
+            return []
+        lines = []
+        data = self.pending + chunk
+        while True:
+            cut = data.find(b"\n")
+            if cut < 0:
+                break
+            line, data = data[:cut], data[cut + 1:]
+            if self.discarding:
+                # The tail of a line already given up on.
+                self.discarding = False
+                continue
+            if len(line) > self.limit:
+                if not self._overflow():
+                    return lines
+                continue
+            lines.append(line)
+        if self.discarding:
+            data = b""
+        elif len(data) > self.limit:
+            if not self._overflow():
+                return lines
+            # Drop what has accumulated and keep dropping until the newline
+            # that ends this line, so pending never exceeds the cap.
+            self.discarding = True
+            data = b""
+        self.pending = data
+        return lines
+
+    def _overflow(self):
+        """Record an overflow. Returns True if framing may continue."""
+        self.overflowed = True
+        self.dropped += 1
+        self.pending = b""
+        return self.policy == "drop"
+
+
+def _worker_preexec():
+    # Ask for SIGTERM when the supervisor dies, so a SIGKILLed supervisor does
+    # not leave a worker sampling forever with nobody reading. Linux-only and
+    # best-effort: if it fails, the worker still exits on stdin EOF.
+    try:
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.prctl(1, signal.SIGTERM, 0, 0, 0)  # PR_SET_PDEATHSIG
+    except Exception:
+        pass
+
+
+def supervise(worker_cmd, stdin=None, out=None, err=None):
+    """Run `worker_cmd` in its own session and relay its output under bounds.
+
+    Returns the exit code the supervisor should exit with: the worker's own
+    code if it exited by itself, 0 on stdin EOF, and 1 if the worker had to
+    be killed for overflowing a frame.
+    """
+    stdin = sys.stdin if stdin is None else stdin
+    out = sys.stdout.buffer if out is None else out
+    err = sys.stderr if err is None else err
+
+    try:
+        worker = subprocess.Popen(
+            worker_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+            preexec_fn=_worker_preexec,
+        )
+    except OSError as exc:
+        err.write("plain-english-activity: cannot start worker: %s\n" % exc)
+        err.flush()
+        return 1
+    register_child(worker)
+
+    frames = LineFramer(MAX_FRAME_BYTES, "fatal")
+    noise = LineFramer(MAX_STDERR_LINE_BYTES, "drop")
+    fds = {}
+    for stream in (worker.stdout, worker.stderr):
+        os.set_blocking(stream.fileno(), False)
+        fds[stream.fileno()] = stream
+    try:
+        control_fd = stdin.fileno()
+    except (AttributeError, ValueError, OSError):
+        control_fd = None
+
+    status = None
+    reason = None
+    try:
+        while status is None:
+            watch = list(fds) + ([control_fd] if control_fd is not None else [])
+            try:
+                ready, _, _ = select.select(watch, [], [], 1.0)
+            except (OSError, ValueError):
+                ready = []
+            for fd in ready:
+                if fd == control_fd:
+                    # Control lines are tiny and few; relay them as-is. EOF
+                    # means the front-end is gone and so is our reason to run.
+                    try:
+                        line = os.read(fd, 4096)
+                    except OSError:
+                        line = b""
+                    if not line:
+                        control_fd = None
+                        status = 0
+                        break
+                    try:
+                        worker.stdin.write(line)
+                        worker.stdin.flush()
+                    except (OSError, ValueError):
+                        pass
+                    continue
+                stream = fds[fd]
+                try:
+                    chunk = os.read(fd, 65536)
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    del fds[fd]
+                    continue
+                if stream is worker.stdout:
+                    for line in frames.feed(chunk):
+                        out.write(line + b"\n")
+                    out.flush()
+                    if frames.overflowed:
+                        reason = ("worker sent a line over %d bytes; stopping it"
+                                  % MAX_FRAME_BYTES)
+                        status = 1
+                        break
+                else:
+                    for line in noise.feed(chunk):
+                        err.write(line.decode("utf-8", "replace") + "\n")
+                    err.flush()
+            if status is not None:
+                break
+            if worker.poll() is not None and not any(
+                    s is worker.stdout for s in fds.values()):
+                # Worker gone and its stdout drained. Its exit code is ours,
+                # so the front-end's backoff applies to a crashing worker.
+                status = worker.returncode
+    except BrokenPipeError:
+        status = 0
+    finally:
+        if reason:
+            err.write("plain-english-activity: %s\n" % reason)
+            err.flush()
+        terminate_group(worker)
+    if noise.dropped:
+        err.write("plain-english-activity: dropped %d oversized stderr line(s)\n"
+                  % noise.dropped)
+        err.flush()
+    return status if status is not None else 1
+
+
+def worker_command(args):
+    """The command line for our own worker: this script, with --worker."""
+    self_path = os.path.abspath(sys.argv[0] if sys.argv and sys.argv[0] else __file__)
+    return [sys.executable, self_path, "--worker"] + [a for a in args if a != "--worker"]
+
+
 def main():
     install_cleanup()
     args = sys.argv[1:]
     watch = "--watch" in args
     as_text = "--text" in args
+
+    if watch and "--worker" not in args:
+        # The long-lived mode runs behind the supervisor above. One-shot and
+        # --text runs from a terminal do not need it.
+        raise SystemExit(supervise(worker_command(args)))
 
     def number_arg(flag, fallback):
         for i, arg in enumerate(args):

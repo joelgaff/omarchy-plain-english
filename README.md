@@ -229,23 +229,42 @@ oversized file is skipped rather than truncated -- a half-read
 `/proc/<pid>/stat` would parse into wrong numbers, which is worse than none.
 One scan examines a bounded number of processes.
 
-**No child outlives the helper.** Quickshell terminates the helper, not its
-descendants, so the helper tracks its own children and reaps them from
-`SIGTERM`, `SIGINT`, `SIGHUP` and `atexit`. `SIGKILL` cannot be trapped, which
-is why the bounded deadlines above matter: they keep the window in which any
-child exists as short as possible.
+**A supervisor stands between the worker and the front-end.** Quickshell's
+stream parsers expose no buffer cap -- `SplitParser` has only `splitMarker`,
+`StdioCollector` only `text`/`data`/`waitForEnd`, and `FileView` has no size
+limit -- so a byte cap cannot be enforced inside the parser, before delimiter
+buffering. Nor can Quickshell's `Process` signal a process group. Both bounds
+therefore live one layer down. `--watch` runs as two processes: the one
+Quickshell launches is a small supervisor, and the sampling worker is its
+child in its own session. The supervisor frames the worker's stdout into
+newline-terminated lines under a hard 16 KB cap and forwards only complete
+ones. A line that grows past the cap without a newline, or a complete line
+over it, is fatal: the worker's whole group is terminated and reaped and the
+supervisor exits non-zero, so the restart backoff below applies. Stderr is
+framed the same way at 512 bytes, but overflow there just drops the offending
+line -- noise on stderr is not a reason to lose the report stream. That bounds
+memory in bytes, not merely in time, and it holds for a worker that is older,
+replaced mid-update, or faulty, because the worker's output never reaches
+QML unframed.
 
-**A wedged helper is detected and replaced.** Quickshell's stream parsers
-expose no buffer cap -- `SplitParser` has only `splitMarker`, `StdioCollector`
-only `text`/`data`/`waitForEnd`, and `FileView` has no size limit -- so a byte
-cap cannot be enforced inside the parser, before delimiter buffering. The
-shipped helper cannot exploit that: it emits newline-terminated lines under a
-hard 16 KB cap and fails closed. For a helper that is *not* the shipped one --
-replaced mid-update, older, or faulty -- a stall watchdog covers it. Such a
-helper produces no complete lines, so the absence of a report is the
-detectable symptom; after three intervals it is terminated, its descendants
-reaped, and a fresh one started. An oversized line that does arrive terminates
-the helper rather than merely being skipped.
+**No child outlives the helper.** Quickshell terminates the process it
+started, not that process's descendants, so the supervisor owns the worker's
+session: on `SIGTERM`, `SIGINT`, `SIGHUP`, stdin EOF, or exit for any other
+reason it sends `SIGTERM` then `SIGKILL` to the whole group and reaps it. The
+worker in turn tracks its own `hyprctl` children and reaps them the same way,
+and asks the kernel for `SIGTERM` if its supervisor dies without warning
+(`PR_SET_PDEATHSIG`) -- which covers `SIGKILL`, the one signal the supervisor
+cannot trap.
+
+**A silent helper is detected and replaced.** The byte bound above says
+nothing about a helper that is alive but says nothing, so a stall watchdog
+covers that: after three of the longest configured interval without a valid
+report, the helper is sent `SIGTERM`, escalated to a forced stop if it
+ignores that, and started fresh. The escalation timer is cancelled the moment
+the old process exits, so it can only ever act on the process it was armed
+for and never on the healthy replacement that the restart brings up. An
+oversized line that does arrive terminates the helper rather than merely
+being skipped.
 
 **The helper is supervised.** If it exits unexpectedly the front-end restarts
 it with exponential backoff, giving up after five attempts with a message

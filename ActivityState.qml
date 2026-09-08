@@ -71,26 +71,36 @@ QtObject {
   // Quickshell's DataStreamParser types expose no buffer cap: SplitParser has
   // only splitMarker, StdioCollector only text/data/waitForEnd, and FileView
   // has no size limit either. So a byte cap cannot be enforced inside the
-  // parser, before delimiter buffering -- a helper that wrote endlessly with
-  // no newline would grow the parser's buffer with nothing in QML to stop it.
+  // parser, before delimiter buffering. Nor can Process signal a process
+  // group. Both bounds therefore live one layer down: the process launched
+  // here is the helper's supervisor, which frames the sampling worker's
+  // stdout and stderr under hard byte caps, forwards only complete lines,
+  // and owns the worker's session -- killing the whole group on overflow,
+  // on SIGTERM, or when this side goes away. What reaches SplitParser is
+  // always newline-terminated and under 16KB, or the supervisor has already
+  // exited non-zero and the backoff restart below applies.
   //
-  // The shipped helper cannot do that: it emits newline-terminated lines
-  // under a hard 16KB cap and fails closed. This watchdog covers the case
-  // where the helper is not the shipped one -- replaced mid-update, older, or
-  // faulty. A helper buffering an unterminated line produces no complete
-  // lines, so the absence of a report is the detectable symptom, and killing
-  // it bounds the time any such buffer can grow.
+  // That bounds memory in bytes. The stall watchdog is the bound in time:
+  // a helper that is alive but silent -- wedged, or a supervisor that is
+  // itself stuck -- is detected by the absence of reports and replaced.
   function killHelper(reason) {
     root.error = reason
     if (!reporter.running) return
-    // SIGTERM rather than SIGKILL: the helper traps it and reaps its own
-    // descendants. forceKill closes the window if it does not go quietly.
+    // SIGTERM rather than SIGKILL: the supervisor traps it and tears down
+    // the worker's group. forceKill closes the window if it does not go
+    // quietly. The timer is cancelled in onExited, so it can only ever act
+    // on the process it was armed for, never on a replacement.
     reporter.signal(15)
     forceKill.restart()
   }
 
+  // Three of the longest interval the helper may legitimately be quiet for.
+  // The idle interval counts too: while the panel is closed the helper
+  // reports at that cadence, and a watchdog set from the open interval alone
+  // would kill a healthy helper whenever idleIntervalSec exceeded ten seconds.
   function noteProgress() {
-    stallWatchdog.interval = Math.max(30000, root.intervalSec * 3000)
+    var longest = Math.max(root.intervalSec, root.idleIntervalSec)
+    stallWatchdog.interval = Math.max(30000, longest * 3000)
     stallWatchdog.restart()
   }
 
@@ -251,6 +261,8 @@ QtObject {
 
     // A restart loses the helper's idea of panel state, so re-assert it.
     onStarted: {
+      // A pending escalation belongs to a previous process, never this one.
+      forceKill.stop()
       if (root.anyPanelOpen) write("open\n")
       root.noteProgress()
     }
@@ -274,6 +286,11 @@ QtObject {
     }
 
     onExited: function(exitCode) {
+      // The process forceKill was armed for is gone, whether it went quietly
+      // or not. Left running, the timer would fire after the supervised
+      // restart and stop the healthy replacement instead.
+      forceKill.stop()
+      stallWatchdog.stop()
       if (root.stopping) return
       // Supervision: a helper that dies leaves the bar frozen on a stale
       // reading with nothing to say it has stopped. Restart it, backing off
@@ -304,7 +321,8 @@ QtObject {
 
   // Escalation if SIGTERM is ignored. Dropping running to false makes
   // Quickshell tear the process down, which fires onExited and the usual
-  // supervised restart.
+  // supervised restart. The worker asks the kernel for SIGTERM when its
+  // supervisor dies, so even this path does not orphan it.
   property Timer forceKill: Timer {
     interval: 3000
     repeat: false
