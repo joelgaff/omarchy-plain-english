@@ -41,3 +41,25 @@ a = a.replace('"a b[31mc d"', '"a\\u0000b\\u001b[31mc\\u2028d"')
 open(tmp + "/harness.js", "w", encoding="utf-8").write("\n".join(out) + "\n" + a)
 PY
 node "$tmp/harness.js"
+
+echo
+echo "== ask-an-agent prompt and launch (Panel.qml) =="
+python3 - "$tmp" <<'PY'
+import re, sys
+tmp = sys.argv[1]
+src = open("Panel.qml", encoding="utf-8").read()
+out = ["const root = { maxQuestionChars:500 };"]
+for n in ["plainText", "investigatePrompt"]:
+    m = re.search(r"\n  function %s\(.*?\n  \}" % n, src, re.S)
+    if not m:
+        raise SystemExit("could not extract %s from Panel.qml" % n)
+    out.append(m.group(0))
+    out.append("root.%s = %s;" % (n, n))
+m = re.search(r"\n  readonly property string agentLaunchScript:(.*?)\n\n", src, re.S)
+if not m:
+    raise SystemExit("could not extract agentLaunchScript from Panel.qml")
+out.append("root.agentLaunchScript = " + m.group(1).strip() + ";")
+a = open("test/panel_assertions.js", encoding="utf-8").read()
+open(tmp + "/panel_harness.js", "w", encoding="utf-8").write("\n".join(out) + "\n" + a)
+PY
+node "$tmp/panel_harness.js"

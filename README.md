@@ -93,7 +93,24 @@ the same commands every plugin uses.
 | Middle click | Open btop, for when you want the raw numbers after all |
 | `r` | Refresh, while the panel is open |
 | `b` | Open btop and close the panel |
+| Click a line | Ask your default agent about it (see below) |
 | `Esc` | Close |
+
+### Asking an agent about a line
+
+Hover over any line in the report and it shows **Ask agent ›**. Click it and a
+one-line box appears at the bottom, already referencing that line. Type a
+question, or just press Enter for "what is going on here, and should I do
+anything about it?". Your default Omarchy agent (`omarchy default agent`) opens
+in a terminal with the line and the question, ready to investigate. If you have
+not chosen a default, Omarchy's picker opens instead. `Esc`, or clicking the
+same line again, cancels.
+
+Omarchy starts agents in their no-approval mode. The line you send is built
+from process names and window titles, which any program can set, so the prompt
+marks it as a claim to check rather than instructions, and asks the agent to
+check with you before stopping, killing, or changing anything. Read what it
+proposes before you let it act on a line you did not expect.
 
 It can also be summoned from a keybinding or a script:
 
@@ -285,8 +302,8 @@ It reads, all locally:
 
 It makes **no network connections**, sends **no telemetry**, writes **no files**,
 and needs **no elevated privileges**. It never kills or changes a process — it
-only reports. The one command it can launch is `btop`, on middle click, and
-only because you asked for it.
+only reports. The only commands it can launch are `btop`, on middle click, and
+your default agent, when you ask about a line, and only because you asked.
 
 ## Licence
 
